@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# privleg — manage holistic user rights, as a holistic service.
+# Single-file bash CLI (hostek-style): owns install, lifecycle, and the two narrow root
+# wrappers that toggle group membership. privleg is the MANAGEMENT plane for the holistic
+# rights standard; each service still ENFORCES its own rights via Linux group membership,
+# so a host without privleg behaves exactly as before. The systemd unit, Caddy route,
+# sudoers drop-in, the privileged wrappers, and privleg's own rights manifest are all
+# generated inline by `privleg setup` — this script is their source of truth.
+
+set -euo pipefail
+
+PRIVLEG_VERSION="0.1.0"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ORIG_ARGS=("$@")
+
+# ── config (override via env) ───────────────────────────────────────────────────
+: "${HOLISTIC_REPO:=}"                                  # holistic repo; autodetected if empty
+: "${PRIVLEG_APP:=/opt/privleg}"                        # install prefix (binary lives here)
+: "${PRIVLEG_USER:=privleg}"                            # unprivileged system user
+: "${PRIVLEG_PORT:=8772}"                               # loopback port for privlegd
+: "${PRIVLEG_ADMIN_GROUP:=sudo}"                        # Linux group that is "admin"
+: "${PRIVLEG_USERS_GROUP:=smbusers}"                    # group whose members are holistic users
+: "${HOLISTIC_SECRET_FILE:=/etc/holistic/jwt-secret}"   # shared session-signing secret
+: "${HOLISTIC_GROUP:=holistic}"                         # group that owns the shared secret
+
+GRANT_WRAPPER=/usr/local/sbin/privleg-grant
+ADMIN_WRAPPER=/usr/local/sbin/privleg-set-admin
+SUDOERS=/etc/sudoers.d/privleg
+UNIT=/etc/systemd/system/privleg.service
+CADDY_ROUTE=/etc/caddy/conf.d/privleg.caddy
+PERMS_FILE=/etc/holistic/permissions.d/privleg.json
+PERMS_TOOL=/usr/local/lib/holistic/holistic-perms.py
+
+# ── output ──────────────────────────────────────────────────────────────────────
+log()  { [ "${PRIVLEG_QUIET:-0}" = "1" ] || printf '[privleg] %s\n' "$*"; }
+warn() { printf '[privleg] warning: %s\n' "$*" >&2; }
+die()  { printf '[privleg] error: %s\n' "$*" >&2; exit "${2:-1}"; }
+
+confirm() {
+  [ "${PRIVLEG_YES:-0}" = "1" ] && return 0
+  local reply
+  printf '[privleg] %s [y/N] ' "$1" >&2
+  read -r reply || return 1
+  [[ "$reply" =~ ^[yY]$ ]]
+}
+
+# Re-exec under sudo, preserving env + the original argv.
+needs_root() {
+  [ "$(id -u)" -eq 0 ] && return 0
+  command -v sudo >/dev/null || die "must run as root (sudo not found)"
+  exec sudo -E "$0" "${ORIG_ARGS[@]}"
+}
+
+# A NOPASSWD-to-root wrapper that is not root-owned or is group/other-writable is an
+# escalation. Refuse to keep it installed. (mirrors holistic/hostek assert_safe_perms)
+assert_safe_perms() {
+  local f owner mode
+  for f in "$@"; do
+    [ -e "$f" ] || continue
+    owner="$(stat -c '%U' "$f")"
+    mode="$(stat -c '%a' "$f")"
+    [ "$owner" = "root" ] || die "$f not owned by root (owner=$owner)"
+    if [[ "${mode: -1}" =~ [2367] || "${mode: -2:1}" =~ [2367] ]]; then
+      die "$f is group/other-writable (mode=$mode)"
+    fi
+  done
+}
+
+# ── holistic repo discovery ──────────────────────────────────────────────────────
+is_holistic_repo() { [ -x "$1/holistic" ] && [ -f "$1/frontend/app/src/registry.ts" ]; }
+
+detect_holistic_repo() {
+  if [ -n "$HOLISTIC_REPO" ]; then
+    is_holistic_repo "$HOLISTIC_REPO" \
+      || die "HOLISTIC_REPO=$HOLISTIC_REPO is not a holistic repo (missing ./holistic or frontend)"
+    ( cd "$HOLISTIC_REPO" && pwd ); return 0
+  fi
+  local c
+  for c in "$REPO_ROOT/../holistic" /code/holistic "$HOME/holistic" /home/*/holistic; do
+    [ -e "$c" ] && is_holistic_repo "$c" && { ( cd "$c" && pwd ); return 0; }
+  done
+  return 1
+}
+
+# ── build ─────────────────────────────────────────────────────────────────────────
+ensure_go() {
+  command -v go >/dev/null && return 0
+  log "installing Go toolchain..."
+  apt-get update -qq
+  apt-get install -y -qq golang-go >/dev/null
+  command -v go >/dev/null || die "Go install failed" 4
+}
+
+build_daemon() {
+  ensure_go
+  log "building privlegd..."
+  install -d -o "$PRIVLEG_USER" -g "$PRIVLEG_USER" -m 0755 "$PRIVLEG_APP" "$PRIVLEG_APP/bin"
+  ( cd "$REPO_ROOT/backend" && GOCACHE=/tmp/privleg-gocache go build -o "$PRIVLEG_APP/bin/privlegd" ./cmd/privlegd )
+  chown -R "$PRIVLEG_USER:$PRIVLEG_USER" "$PRIVLEG_APP"
+}
+
+# ── inline artifact generators ─────────────────────────────────────────────────────
+write_grant_wrapper() {
+  # Toggle membership in a DECLARED rights group only. Fails closed: the group must match
+  # the hp_* pattern, must NOT be a protected group, and MUST be declared in a
+  # permissions.d manifest (verified via holistic-perms is-declared). This is the hard
+  # boundary that keeps privleg from ever touching sudo/family/smbusers/etc.
+  cat > "$GRANT_WRAPPER" <<'GRANT'
+#!/usr/bin/env bash
+# privleg-grant <user> <hp_group> <on|off> — add/remove a user to/from a DECLARED rights
+# group. Generated by `privleg setup`; root-owned 0750, invoked by privlegd via `sudo -n`.
+set -euo pipefail
+PERMS_TOOL=/usr/local/lib/holistic/holistic-perms.py
+
+user="${1:-}"; group="${2:-}"; action="${3:-}"
+[[ "$user"  =~ ^[a-z][a-z0-9_-]{0,31}$ ]]      || { echo "privleg-grant: invalid user" >&2; exit 2; }
+[[ "$group" =~ ^hp_[a-z0-9][a-z0-9_-]{0,27}$ ]] || { echo "privleg-grant: invalid group" >&2; exit 2; }
+[[ "$action" == on || "$action" == off ]]      || { echo "privleg-grant: action must be on|off" >&2; exit 2; }
+
+# Defense in depth: never touch a protected group, even if one were somehow declared.
+case "$group" in
+  sudo|root|wheel|adm|staff|family|smbusers|holistic)
+    echo "privleg-grant: refusing protected group '$group'" >&2; exit 3 ;;
+esac
+
+# The group MUST back a declared right. Fail closed if the holistic perms tool is absent.
+[ -f "$PERMS_TOOL" ] || { echo "privleg-grant: holistic perms tool missing" >&2; exit 4; }
+python3 "$PERMS_TOOL" is-declared "$group" \
+  || { echo "privleg-grant: '$group' is not a declared right" >&2; exit 4; }
+
+id "$user" >/dev/null 2>&1 || { echo "privleg-grant: no such user '$user'" >&2; exit 5; }
+
+if [ "$action" = on ]; then
+  gpasswd -a "$user" "$group" >/dev/null
+else
+  gpasswd -d "$user" "$group" >/dev/null 2>&1 || true   # idempotent removal
+fi
+GRANT
+  chown root:root "$GRANT_WRAPPER"
+  chmod 0750 "$GRANT_WRAPPER"
+}
+
+write_admin_wrapper() {
+  # Toggle membership in the admin group ONLY (default sudo). The admin group is baked in at
+  # generation time; the wrapper can touch nothing else. Generated 0750 root:root.
+  {
+    echo '#!/usr/bin/env bash'
+    echo '# privleg-set-admin <user> <on|off> — add/remove a user to/from the admin group.'
+    echo '# Generated by `privleg setup`; root-owned 0750, invoked by privlegd via `sudo -n`.'
+    echo 'set -euo pipefail'
+    printf 'ADMIN_GROUP=%q\n' "$PRIVLEG_ADMIN_GROUP"
+    cat <<'ADMINREST'
+user="${1:-}"; action="${2:-}"
+[[ "$user" =~ ^[a-z][a-z0-9_-]{0,31}$ ]]   || { echo "privleg-set-admin: invalid user" >&2; exit 2; }
+[[ "$action" == on || "$action" == off ]]  || { echo "privleg-set-admin: action must be on|off" >&2; exit 2; }
+id "$user" >/dev/null 2>&1                  || { echo "privleg-set-admin: no such user '$user'" >&2; exit 5; }
+if [ "$action" = on ]; then
+  gpasswd -a "$user" "$ADMIN_GROUP" >/dev/null
+else
+  gpasswd -d "$user" "$ADMIN_GROUP" >/dev/null 2>&1 || true
+fi
+ADMINREST
+  } > "$ADMIN_WRAPPER"
+  chown root:root "$ADMIN_WRAPPER"
+  chmod 0750 "$ADMIN_WRAPPER"
+}
+
+write_sudoers() {
+  local tmp; tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
+# Generated by \`privleg setup\`. privlegd runs unprivileged and escalates ONLY to these two
+# fixed wrappers, which themselves refuse anything but declared hp_* groups / the admin group.
+# Installed root:root 0440 at $SUDOERS (validated by visudo).
+$PRIVLEG_USER ALL=(root) NOPASSWD: $GRANT_WRAPPER, $ADMIN_WRAPPER
+EOF
+  if ! visudo -cf "$tmp" >/dev/null; then
+    rm -f "$tmp"; die "sudoers validation failed" 4
+  fi
+  install -m 0440 -o root -g root "$tmp" "$SUDOERS"
+  rm -f "$tmp"
+}
+
+write_permissions() {
+  # privleg's OWN rights manifest (self-reference): it declares, through the same standard,
+  # the meta-rights that let a NON-admin manage OTHER users' rights for a given service.
+  # Granting these is admin-only (the daemon refuses to delegate privleg's own meta-rights).
+  install -d -o "$HOLISTIC_GROUP" -g "$HOLISTIC_GROUP" -m 0755 /etc/holistic/permissions.d 2>/dev/null \
+    || install -d -m 0755 /etc/holistic/permissions.d
+  cat > "$PERMS_FILE" <<'JSON'
+{
+  "service": "privleg",
+  "version": 1,
+  "categories": [
+    {
+      "id": "delegation",
+      "label": "Rechte-Delegation",
+      "description": "Erlaubt einem Nicht-Admin, die Rechte ANDERER Benutzer für einen bestimmten Dienst zu verwalten. Admin-Status und privlegs eigene Delegationsrechte bleiben Admins vorbehalten.",
+      "permissions": [
+        {
+          "id": "manage-hostek",
+          "label": "hostek-Rechte verwalten",
+          "description": "Darf die hostek-Rechte anderer Benutzer setzen und entziehen.",
+          "group": "hp_priv_dlg_hostek",
+          "default": false
+        },
+        {
+          "id": "manage-samba",
+          "label": "samba-Rechte verwalten",
+          "description": "Darf die samba-Rechte anderer Benutzer setzen und entziehen.",
+          "group": "hp_priv_dlg_samba",
+          "default": false
+        }
+      ]
+    },
+    {
+      "id": "users",
+      "label": "Benutzer",
+      "description": "Einsicht in die Benutzerverwaltung.",
+      "permissions": [
+        {
+          "id": "view",
+          "label": "Benutzer ansehen",
+          "description": "Darf die Benutzerliste und ihre Rechte einsehen, ohne etwas zu ändern.",
+          "group": "hp_priv_view",
+          "default": false
+        }
+      ]
+    }
+  ]
+}
+JSON
+  chmod 0644 "$PERMS_FILE"
+  local g
+  for g in hp_priv_dlg_hostek hp_priv_dlg_samba hp_priv_view; do
+    groupadd -f "$g"
+  done
+}
+
+write_unit() {
+  cat > "$UNIT" <<EOF
+[Unit]
+Description=privleg — holistic user rights management (holistic service)
+After=network.target holistic-dashboard.service
+
+[Service]
+User=$PRIVLEG_USER
+Group=$PRIVLEG_USER
+# Validate the same session as the dashboard via the shared JWT secret.
+Environment=HOLISTIC_SECRET_FILE=$HOLISTIC_SECRET_FILE
+Environment=PRIVLEG_ADMIN_GROUP=$PRIVLEG_ADMIN_GROUP
+Environment=PRIVLEG_USERS_GROUP=$PRIVLEG_USERS_GROUP
+ExecStart=$PRIVLEG_APP/bin/privlegd --listen 127.0.0.1:$PRIVLEG_PORT
+Restart=on-failure
+RestartSec=2
+# Must be false: the daemon escalates via the narrow sudo wrapper allowlist to change groups.
+NoNewPrivileges=false
+# Conservative hardening; ProtectSystem etc. deliberately omitted (they break sudo + gpasswd).
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+write_caddy_route() {
+  install -d /etc/caddy/conf.d
+  cat > "$CADDY_ROUTE" <<EOF
+# Generated by \`privleg setup\`. Routes the service API to the privleg Go daemon.
+# Imported by holistic's Caddyfile; the more-specific /api/services/privleg/* path wins.
+handle /api/services/privleg/* {
+	reverse_proxy 127.0.0.1:$PRIVLEG_PORT
+}
+EOF
+}
+
+# ── secret access ───────────────────────────────────────────────────────────────
+grant_secret_access() {
+  if [ ! -f "$HOLISTIC_SECRET_FILE" ]; then
+    warn "$HOLISTIC_SECRET_FILE not found — install the holistic dashboard first"
+    return 0
+  fi
+  getent group "$HOLISTIC_GROUP" >/dev/null \
+    || die "group '$HOLISTIC_GROUP' missing — install the dashboard first" 5
+  usermod -aG "$HOLISTIC_GROUP" "$PRIVLEG_USER"   # must succeed or the daemon can't read the secret
+  chgrp "$HOLISTIC_GROUP" "$HOLISTIC_SECRET_FILE"
+  chmod 0640 "$HOLISTIC_SECRET_FILE"
+}
+
+# ── commands ──────────────────────────────────────────────────────────────────────
+cmd_setup() {
+  needs_root
+  local holistic; holistic="$(detect_holistic_repo)" \
+    || die "holistic repo not found — set HOLISTIC_REPO=/path/to/holistic" 5
+  log "using holistic repo: $holistic"
+
+  log "system user + directories..."
+  getent group "$PRIVLEG_USER" >/dev/null || groupadd --system "$PRIVLEG_USER"
+  getent passwd "$PRIVLEG_USER" >/dev/null \
+    || useradd --system --gid "$PRIVLEG_USER" --shell /usr/sbin/nologin --home-dir /var/lib/privleg "$PRIVLEG_USER"
+  install -d -o "$PRIVLEG_USER" -g "$PRIVLEG_USER" -m 0755 "$PRIVLEG_APP" "$PRIVLEG_APP/bin" /var/lib/privleg
+
+  build_daemon
+
+  log "installing privileged wrappers + sudoers..."
+  write_grant_wrapper
+  write_admin_wrapper
+  write_sudoers
+  assert_safe_perms "$GRANT_WRAPPER" "$ADMIN_WRAPPER" "$SUDOERS"
+
+  log "granting read on the shared JWT secret..."
+  grant_secret_access
+
+  log "declaring rights (permissions.d) + backing groups..."
+  write_permissions
+
+  log "configuring systemd..."
+  write_unit
+  systemctl daemon-reload
+  systemctl enable privleg >/dev/null 2>&1 || true
+
+  log "adding Caddy route..."
+  write_caddy_route
+
+  log "linking UI plugin into holistic + rebuilding dashboard SPA..."
+  install -d "$holistic/frontend/external"
+  ln -sfn "$REPO_ROOT/ui" "$holistic/frontend/external/privleg"
+  "$holistic/holistic" setup dashboard
+
+  systemctl restart privleg
+  if ! systemctl is-active --quiet privleg; then
+    journalctl -u privleg -n 20 --no-pager >&2 || true
+    die "privleg failed to start" 4
+  fi
+  log "installed and started — \"Rechte\" is live in the holistic sidebar"
+}
+
+cmd_build() {
+  needs_root
+  build_daemon
+  if systemctl is-active --quiet privleg; then
+    systemctl restart privleg
+    log "rebuilt and restarted privlegd"
+  else
+    log "rebuilt privlegd (service not running)"
+  fi
+}
+
+cmd_lifecycle() {
+  needs_root
+  local action="$1"
+  systemctl "$action" privleg && log "$action: privleg" \
+    || die "'$action privleg' failed — installed? run 'sudo $0 setup'"
+}
+
+cmd_update() {
+  log "pulling latest..."
+  git -C "$REPO_ROOT" pull --ff-only
+  cmd_setup
+}
+
+cmd_status() {
+  local holistic plugin state
+  state="$(systemctl is-active privleg 2>/dev/null || true)"
+  echo "── privleg $PRIVLEG_VERSION ──"
+  printf '  %-16s %s\n' "daemon:"  "${state:-unknown}"
+  printf '  %-16s %s\n' "listen:"  "127.0.0.1:$PRIVLEG_PORT"
+  printf '  %-16s %s\n' "binary:"  "$([ -x "$PRIVLEG_APP/bin/privlegd" ] && echo "$PRIVLEG_APP/bin/privlegd" || echo '(not built)')"
+  printf '  %-16s %s\n' "grant:"   "$([ -e "$GRANT_WRAPPER" ] && echo present || echo missing)"
+  printf '  %-16s %s\n' "set-admin:" "$([ -e "$ADMIN_WRAPPER" ] && echo present || echo missing)"
+  printf '  %-16s %s\n' "manifest:" "$([ -f "$PERMS_FILE" ] && echo "$PERMS_FILE" || echo missing)"
+  printf '  %-16s %s\n' "route:"   "$([ -f "$CADDY_ROUTE" ] && echo "$CADDY_ROUTE" || echo missing)"
+  if holistic="$(detect_holistic_repo 2>/dev/null)"; then
+    plugin="$holistic/frontend/external/privleg"
+    printf '  %-16s %s\n' "plugin:" "$([ -L "$plugin" ] && echo "linked ($holistic)" || echo "missing ($holistic)")"
+  else
+    printf '  %-16s %s\n' "plugin:" "(holistic repo not found)"
+  fi
+  if command -v systemctl >/dev/null; then
+    echo; echo "── systemctl status privleg ──"
+    systemctl --no-pager --lines=3 status privleg 2>&1 || true
+  fi
+}
+
+cmd_uninstall() {
+  needs_root
+  local purge=0
+  [ "${1:-}" = "--purge" ] && purge=1
+  confirm "remove privleg from this server${purge:+ (and purge user + $PRIVLEG_APP)}?" || die "aborted" 10
+
+  systemctl disable --now privleg >/dev/null 2>&1 || true
+  rm -f "$UNIT"; systemctl daemon-reload
+  rm -f "$CADDY_ROUTE" "$SUDOERS" "$GRANT_WRAPPER" "$ADMIN_WRAPPER" "$PERMS_FILE"
+
+  local holistic
+  if holistic="$(detect_holistic_repo 2>/dev/null)"; then
+    rm -f "$holistic/frontend/external/privleg"
+    log "rebuilding dashboard SPA without privleg..."
+    "$holistic/holistic" setup dashboard || warn "dashboard rebuild failed — run it manually to drop the Rechte tab"
+  else
+    warn "holistic repo not found — remove frontend/external/privleg + rebuild the SPA manually"
+  fi
+
+  if [ "$purge" = "1" ]; then
+    userdel "$PRIVLEG_USER" >/dev/null 2>&1 || true
+    groupdel "$PRIVLEG_USER" >/dev/null 2>&1 || true
+    local g
+    for g in hp_priv_dlg_hostek hp_priv_dlg_samba hp_priv_view; do
+      groupdel "$g" >/dev/null 2>&1 || true
+    done
+    rm -rf "$PRIVLEG_APP" /var/lib/privleg
+    log "purged user, delegation groups, $PRIVLEG_APP, /var/lib/privleg"
+  fi
+  log "uninstalled — existing rights groups + grants are left intact"
+}
+
+cmd_help() {
+  cat <<EOF
+privleg $PRIVLEG_VERSION — manage holistic user rights, as a holistic service.
+
+Usage:
+  privleg setup                 Install/repair privleg as a holistic service (builds the
+                                daemon, wires systemd + sudo + Caddy, links the UI plugin
+                                and rebuilds the dashboard SPA). Self-elevates via sudo.
+  privleg build                 Rebuild the Go daemon only, then restart if running
+  privleg start|stop|restart    Control the privleg daemon
+  privleg status                Show daemon, wrappers, route, and plugin-link health
+  privleg update                git pull --ff-only + re-run setup
+  privleg uninstall [--purge]   Remove privleg (--purge also drops the user + $PRIVLEG_APP)
+  privleg help | version
+
+Quickstart:
+  sudo ./privleg setup          # HOLISTIC_REPO is autodetected (sibling ../holistic, …)
+
+Env (override defaults):
+  HOLISTIC_REPO        path to the holistic repo (autodetected if unset)
+  PRIVLEG_PORT         loopback port for privlegd (default $PRIVLEG_PORT)
+  PRIVLEG_ADMIN_GROUP  Linux group that is "admin" (default $PRIVLEG_ADMIN_GROUP)
+  PRIVLEG_YES=1        skip confirmation prompts   ·   PRIVLEG_QUIET=1  only warnings/errors
+
+Generated artifacts (this script is their source of truth):
+  $UNIT
+  $CADDY_ROUTE
+  $SUDOERS
+  $PERMS_FILE
+  $GRANT_WRAPPER
+  $ADMIN_WRAPPER
+
+Exit codes: 0 ok · 1 generic · 2 usage · 4 external · 5 config-state · 10 declined
+EOF
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────────
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    setup)                cmd_setup "$@" ;;
+    build)                cmd_build "$@" ;;
+    start|stop|restart)   cmd_lifecycle "$cmd" ;;
+    status)               cmd_status "$@" ;;
+    update)               cmd_update "$@" ;;
+    uninstall)            cmd_uninstall "$@" ;;
+    version|-v|--version) echo "privleg $PRIVLEG_VERSION" ;;
+    help|-h|--help)       cmd_help ;;
+    *) die "unknown command: $cmd (run 'privleg help')" 2 ;;
+  esac
+}
+
+main "$@"
