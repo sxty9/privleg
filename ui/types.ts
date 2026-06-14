@@ -19,3 +19,25 @@ export interface CatalogResponse {
 
 // GET/PUT users/{u}/grants return the same per-user shape.
 export type GrantsResponse = PrivlegUser;
+
+// --- invites (GET/POST invites, POST invites/{id}/revoke) ---
+export type InviteState = 'active' | 'used' | 'revoked' | 'expired';
+
+export interface Invite {
+  id: string;
+  note: string;
+  created: number; // unix seconds
+  expires: number | null; // unix seconds, null = never
+  usedBy: string; // "" until consumed
+  usedAt: number | null;
+  state: InviteState;
+}
+
+export interface InvitesResponse {
+  invites: Invite[];
+}
+
+// POST invites returns the plaintext code exactly once.
+export interface CreatedInvite {
+  code: string;
+}

@@ -3,7 +3,9 @@
 Manage **holistic user rights**, as a holistic service. privleg is the management plane
 for the holistic *rights standard*: it lets admins (and delegated managers) see every
 user, toggle a user admin/non-admin, and grant or revoke each service's fine-grained
-rights — all backed by Linux group membership, the single source of truth.
+rights — all backed by Linux group membership, the single source of truth. It also hosts
+**registration invites**: minting, listing and revoking the codes a new person needs to
+sign up (admins, or non-admins holding the `hp_priv_invite` right).
 
 ```bash
 sudo ./privleg setup          # build daemon, wire systemd + sudo + Caddy, link UI, rebuild SPA
@@ -35,6 +37,11 @@ behind the shared holistic JWT session, and a `@holistic/ui` plugin provides the
     `hp_*` group (verified via `holistic-perms is-declared`), and hard-refuses
     `sudo`/`family`/`smbusers`/etc. Fails closed.
   - `privleg-set-admin <user> <on|off>` — touches the admin group **only**.
+  - `privleg-invite-new <days> [note]` / `privleg-invite-revoke <id>` — mint / revoke a
+    registration invite by delegating to holistic's `holistic-invites.py` (the single
+    source of truth for the invite store); both re-validate their input. Listing needs no
+    wrapper — privlegd reads `/var/lib/holistic/invites.json` directly (it runs in group
+    `holistic`, which the store is group-readable by).
 
 ## Delegation (privleg's self-declared rights)
 
@@ -59,6 +66,9 @@ delegation for, and never grant privleg's own meta-rights — those stay admin-o
 | `GET users/{u}/grants` | manager | one user's held rights |
 | `PUT users/{u}/grants` | admin / service delegate | set a user's rights for the services you manage |
 | `PUT users/{u}/admin` | admin only | toggle admin (not on yourself) |
+| `GET invites` | admin / `hp_priv_invite` | list all registration invites (+ state) |
+| `POST invites` | admin / `hp_priv_invite` | mint a code; returns the plaintext once |
+| `POST invites/{id}/revoke` | admin / `hp_priv_invite` | revoke an invite |
 | `POST refresh` | admin | re-read the rights catalog |
 
 Errors use holistic's `{"detail": "..."}` contract.
@@ -71,9 +81,10 @@ backend/cmd/privlegd/main.go    daemon entry point (127.0.0.1:8772)
 backend/internal/auth/          shared-JWT session validation (live Linux groups)
 backend/internal/catalog/       reads permissions.d → manifests + group→service index
 backend/internal/users/         enumerates smbusers members, resolves admin + rights
-backend/internal/store/         applies changes via the two root wrappers
+backend/internal/store/         applies rights changes via the two root wrappers
+backend/internal/invites/       reads the invite store; mints/revokes via the invite wrappers
 backend/internal/api/           routes, auth gates, delegation enforcement
-ui/                             @holistic/ui plugin (Users + Rights editor)
+ui/                             @holistic/ui plugin (Users + Rights editor, Invites)
 ```
 
 ## Requirements

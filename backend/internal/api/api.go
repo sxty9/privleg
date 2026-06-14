@@ -18,9 +18,11 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"privleg/internal/auth"
 	"privleg/internal/catalog"
+	"privleg/internal/invites"
 	"privleg/internal/store"
 	"privleg/internal/users"
 )
@@ -31,9 +33,16 @@ const (
 	privService = "privleg"      // privleg's own manifest service id (self-reference)
 	dlgPrefix   = "hp_priv_dlg_" // hp_priv_dlg_<service> = "may manage <service> rights for others"
 	viewGroup   = "hp_priv_view" // may view the user list + rights, without changing them
+	inviteGroup = "hp_priv_invite"
+
+	noteMax = 200 // cap the user-supplied invite note before it reaches the store
+	daysMax = 3650
 )
 
-var userRe = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
+var (
+	userRe     = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
+	inviteIDRe = regexp.MustCompile(`^[0-9a-f]{8}$`) // holistic-invites.py ids are token_hex(4)
+)
 
 // Server wires the verifier, catalog and user lister into HTTP handlers.
 type Server struct {
@@ -57,6 +66,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+base+"users/{username}/grants", s.guard(s.isManager, false, s.getGrants))
 	mux.HandleFunc("PUT "+base+"users/{username}/grants", s.guard(s.isManager, true, s.putGrants))
 	mux.HandleFunc("PUT "+base+"users/{username}/admin", s.guard(isAdmin, true, s.setAdmin))
+	mux.HandleFunc("GET "+base+"invites", s.guard(s.canInvite, false, s.listInvites))
+	mux.HandleFunc("POST "+base+"invites", s.guard(s.canInvite, true, s.createInvite))
+	mux.HandleFunc("POST "+base+"invites/{id}/revoke", s.guard(s.canInvite, true, s.revokeInvite))
 	mux.HandleFunc("POST "+base+"refresh", s.guard(isAdmin, false, s.refresh))
 	mux.HandleFunc("GET "+base+"health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -256,6 +268,75 @@ func (s *Server) refresh(w http.ResponseWriter, _ *http.Request, _ *auth.User) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"services": len(s.cat.Manifests())})
+}
+
+// --- invites -------------------------------------------------------------
+// Managing holistic registration invites is the `hp_priv_invite` right, which privleg
+// declares like any other (admin-only to grant). Listing reads the store directly; minting
+// and revoking delegate to the narrow root wrappers (see internal/invites).
+
+// canInvite gates the invite endpoints: admins, or a non-admin holding hp_priv_invite.
+func (s *Server) canInvite(u *auth.User) bool { return u.Can(inviteGroup) }
+
+func (s *Server) listInvites(w http.ResponseWriter, _ *http.Request, _ *auth.User) {
+	list, err := invites.List(time.Now().Unix())
+	if err != nil {
+		log.Printf("privleg: list invites failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "Could not read invites")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"invites": list})
+}
+
+func (s *Server) createInvite(w http.ResponseWriter, r *http.Request, _ *auth.User) {
+	var body struct {
+		Note        string `json:"note"`
+		ExpiresDays int    `json:"expiresDays"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if body.ExpiresDays < 0 || body.ExpiresDays > daysMax {
+		writeErr(w, http.StatusBadRequest, "expiresDays must be between 0 and 3650")
+		return
+	}
+	code, err := invites.New(body.ExpiresDays, sanitizeNote(body.Note))
+	if err != nil {
+		log.Printf("privleg: create invite failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "Could not create the invite")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"code": code})
+}
+
+func (s *Server) revokeInvite(w http.ResponseWriter, r *http.Request, _ *auth.User) {
+	id := r.PathValue("id")
+	if !inviteIDRe.MatchString(id) {
+		writeErr(w, http.StatusBadRequest, "Invalid invite id")
+		return
+	}
+	if err := invites.Revoke(id); err != nil {
+		log.Printf("privleg: revoke invite %s failed: %v", id, err)
+		writeErr(w, http.StatusInternalServerError, "Could not revoke the invite")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// sanitizeNote strips control characters and caps length, defence-in-depth before the value
+// reaches the root wrapper (which re-sanitizes) and the shared invite store.
+func sanitizeNote(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return -1
+		}
+		return r
+	}, s)
+	if len(s) > noteMax {
+		s = s[:noteMax]
+	}
+	return strings.TrimSpace(s)
 }
 
 // --- helpers -------------------------------------------------------------
