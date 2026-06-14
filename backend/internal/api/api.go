@@ -145,6 +145,10 @@ func (s *Server) listUsers(w http.ResponseWriter, _ *http.Request, _ *auth.User)
 }
 
 func (s *Server) getCatalog(w http.ResponseWriter, _ *http.Request, _ *auth.User) {
+	// Re-read the drop-in directory so rights a service just installed or updated show up
+	// live — without needing a privleg restart or a manual refresh. Best-effort: on a read
+	// error the last-good catalog is kept.
+	_ = s.cat.Reload()
 	writeJSON(w, http.StatusOK, map[string]any{"services": s.cat.Manifests()})
 }
 
