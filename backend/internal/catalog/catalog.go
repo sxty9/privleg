@@ -23,6 +23,7 @@ type Perm struct {
 	Group       string `json:"group"`
 	Default     bool   `json:"default,omitempty"`
 	Dangerous   bool   `json:"dangerous,omitempty"`
+	Sensitive   bool   `json:"sensitive,omitempty"`
 }
 
 // Category groups related rights within one service.

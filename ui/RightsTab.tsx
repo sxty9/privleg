@@ -102,6 +102,7 @@ export function RightsTab({ api, ui, user, username, onBack }: Props) {
                       <Stack direction="row" align="center" gap={2}>
                         <Text weight="semibold">{p.label}</Text>
                         {p.dangerous && <Badge variant="warning">heikel</Badge>}
+                        {p.sensitive && <Badge variant="accent">sensibel</Badge>}
                         {p.default && <Badge variant="neutral">Standard: an</Badge>}
                       </Stack>
                       {p.description && (
