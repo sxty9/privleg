@@ -31,6 +31,11 @@ export function RightsTab({ api, ui, user, username, onBack }: Props) {
 
   const held = new Set(target.rights);
 
+  // Rights labels come from each service's manifest (server data, authored in one
+  // language). We localize them by their stable id — service / category / permission —
+  // and fall back to whatever the manifest shipped for rights we don't have a key for.
+  const tr = (key: string, fallback: string) => (t.has(key) ? t(key) : fallback);
+
   // May the calling user manage rights of this service for others? Admins always; a
   // delegated manager only for its service; privleg's own meta-rights are admin-only.
   function canManage(service: string): boolean {
@@ -87,11 +92,11 @@ export function RightsTab({ api, ui, user, username, onBack }: Props) {
 
       {services.flatMap((svc) =>
         svc.categories.map((c) => (
-          <Panel key={`${svc.service}:${c.id}`} title={`${c.label} · ${svc.service}`} className="p-4">
+          <Panel key={`${svc.service}:${c.id}`} title={`${tr(`rights.cat.${svc.service}.${c.id}`, c.label)} · ${tr(`service.${svc.service}`, svc.service)}`} className="p-4">
             <Stack gap={3}>
               {c.description && (
                 <Text variant="footnote" color="secondary">
-                  {c.description}
+                  {tr(`rights.catdesc.${svc.service}.${c.id}`, c.description)}
                 </Text>
               )}
               {c.permissions.map((p) => {
@@ -105,7 +110,7 @@ export function RightsTab({ api, ui, user, username, onBack }: Props) {
                   <Stack key={key} direction="row" align="center" justify="between" gap={3}>
                     <Stack gap={1}>
                       <Stack direction="row" align="center" gap={2}>
-                        <Text weight="semibold">{p.label}</Text>
+                        <Text weight="semibold">{tr(`rights.perm.${svc.service}.${c.id}.${p.id}`, p.label)}</Text>
                         {p.dangerous && <Badge variant="warning">{t('privleg.badgeDangerous')}</Badge>}
                         {/* orange (the `net` token), distinct from the dangerous badge's amber `warning` */}
                         {p.sensitive && <Badge className="bg-net/15 text-net">{t('privleg.badgeSensitive')}</Badge>}
@@ -113,11 +118,11 @@ export function RightsTab({ api, ui, user, username, onBack }: Props) {
                       </Stack>
                       {p.description && (
                         <Text variant="footnote" color="secondary">
-                          {p.description}
+                          {tr(`rights.permdesc.${svc.service}.${c.id}.${p.id}`, p.description)}
                         </Text>
                       )}
                     </Stack>
-                    <Switch checked={on} disabled={disabled} onChange={(next) => toggle(key, p.label, !!p.dangerous, next)} />
+                    <Switch checked={on} disabled={disabled} onChange={(next) => toggle(key, tr(`rights.perm.${svc.service}.${c.id}.${p.id}`, p.label), !!p.dangerous, next)} />
                   </Stack>
                 );
               })}
