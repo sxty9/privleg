@@ -102,7 +102,8 @@ export function RightsTab({ api, ui, user, username, onBack }: Props) {
                       <Stack direction="row" align="center" gap={2}>
                         <Text weight="semibold">{p.label}</Text>
                         {p.dangerous && <Badge variant="warning">heikel</Badge>}
-                        {p.sensitive && <Badge variant="accent">sensibel</Badge>}
+                        {/* orange (the `net` token), distinct from heikel's amber `warning` */}
+                        {p.sensitive && <Badge className="bg-net/15 text-net">sensibel</Badge>}
                         {p.default && <Badge variant="neutral">Standard: an</Badge>}
                       </Stack>
                       {p.description && (
