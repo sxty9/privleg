@@ -6,6 +6,7 @@ package users
 import (
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -101,6 +102,39 @@ func resolveGroups(username string) []string {
 		return strings.Fields(string(out))
 	}
 	return nil
+}
+
+// LoginShell returns the user's login shell (passwd field 7), read live from the OS, and
+// whether the account exists.
+func LoginShell(username string) (string, bool) {
+	out, err := exec.Command("getent", "passwd", username).Output()
+	if err != nil {
+		return "", false
+	}
+	fields := strings.Split(strings.TrimRight(string(out), "\n"), ":")
+	if len(fields) < 7 {
+		return "", false
+	}
+	return fields[6], true
+}
+
+// ShellEnabled reports whether the user is shell-entitled: the account exists and its
+// login shell is a real shell (not nologin/false). This is the single source of truth for
+// "may use a remote shell" — the same field SetShell toggles.
+func ShellEnabled(username string) bool {
+	sh, ok := LoginShell(username)
+	if !ok {
+		return false
+	}
+	sh = strings.TrimSpace(sh)
+	if sh == "" {
+		return false
+	}
+	switch filepath.Base(sh) {
+	case "nologin", "false":
+		return false
+	}
+	return true
 }
 
 func contains(xs []string, want string) bool {

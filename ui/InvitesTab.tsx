@@ -13,16 +13,17 @@ import {
   Stack,
   Text,
   useLiveQuery,
+  useT,
   type Column,
   type ServiceContextProps,
 } from '@holistic/ui';
 import type { CreatedInvite, Invite, InvitesResponse, InviteState } from './types';
 
-const STATE_LABEL: Record<InviteState, string> = {
-  active: 'Aktiv',
-  used: 'Eingelöst',
-  revoked: 'Widerrufen',
-  expired: 'Abgelaufen',
+const STATE_KEY: Record<InviteState, string> = {
+  active: 'privleg.stateActive',
+  used: 'privleg.stateUsed',
+  revoked: 'privleg.stateRevoked',
+  expired: 'privleg.stateExpired',
 };
 const STATE_VARIANT: Record<InviteState, 'success' | 'neutral' | 'danger' | 'warning'> = {
   active: 'success',
@@ -39,6 +40,7 @@ function fmtDate(secs: number | null): string {
 // Full invite management for admins + holders of hp_priv_invite: mint a code, list all
 // codes (incl. who redeemed them), and revoke active ones. The daemon enforces the same gate.
 export function InvitesTab({ api, ui }: ServiceContextProps) {
+  const t = useT();
   const { data, loading, refresh } = useLiveQuery<InvitesResponse>(() => api.get<InvitesResponse>('invites'), 5000);
   const invites = data?.invites ?? [];
 
@@ -57,7 +59,7 @@ export function InvitesTab({ api, ui }: ServiceContextProps) {
       setDays('');
       refresh();
     } catch (e) {
-      ui.toast({ title: 'Konnte keinen Code erzeugen', description: (e as Error).message, variant: 'error' });
+      ui.toast({ title: t('privleg.createCodeError'), description: (e as Error).message, variant: 'error' });
     } finally {
       setBusy(false);
     }
@@ -65,33 +67,31 @@ export function InvitesTab({ api, ui }: ServiceContextProps) {
 
   async function revoke(inv: Invite) {
     const ok = await ui.confirm({
-      title: 'Einladungscode widerrufen?',
-      description: inv.note
-        ? `Die Einladung „${inv.note}" wird ungültig und kann nicht mehr eingelöst werden.`
-        : 'Der Code wird ungültig und kann nicht mehr eingelöst werden.',
+      title: t('privleg.revokeInviteTitle'),
+      description: inv.note ? t('privleg.revokeInviteDescNote', { note: inv.note }) : t('privleg.revokeInviteDesc'),
       danger: true,
-      confirmLabel: 'Widerrufen',
+      confirmLabel: t('privleg.revokeInvite'),
     });
     if (!ok) return;
     try {
       await api.post<{ ok: boolean }>(`invites/${inv.id}/revoke`);
-      ui.toast({ title: 'Widerrufen', variant: 'success' });
+      ui.toast({ title: t('privleg.revoked'), variant: 'success' });
       refresh();
     } catch (e) {
-      ui.toast({ title: 'Konnte nicht widerrufen', description: (e as Error).message, variant: 'error' });
+      ui.toast({ title: t('privleg.revokeFailed'), description: (e as Error).message, variant: 'error' });
     }
   }
 
   const columns: Column<Invite>[] = [
     {
       key: 'note',
-      header: 'Notiz',
+      header: t('privleg.colNote'),
       sortable: true,
       sortValue: (i) => i.note.toLowerCase(),
       hideable: false,
       render: (i) => (
         <Stack gap={0}>
-          <Text weight="semibold">{i.note || 'Ohne Notiz'}</Text>
+          <Text weight="semibold">{i.note || t('privleg.noNote')}</Text>
           <Text variant="footnote" color="secondary">
             {i.id}
           </Text>
@@ -100,20 +100,20 @@ export function InvitesTab({ api, ui }: ServiceContextProps) {
     },
     {
       key: 'state',
-      header: 'Status',
+      header: t('privleg.colStatus'),
       width: 130,
       sortable: true,
       sortValue: (i) => i.state,
-      render: (i) => <Badge variant={STATE_VARIANT[i.state]}>{STATE_LABEL[i.state]}</Badge>,
+      render: (i) => <Badge variant={STATE_VARIANT[i.state]}>{t(STATE_KEY[i.state])}</Badge>,
     },
     {
       key: 'usedBy',
-      header: 'Eingelöst von',
+      header: t('privleg.colRedeemedBy'),
       render: (i) => <Text color="secondary">{i.usedBy || '—'}</Text>,
     },
     {
       key: 'created',
-      header: 'Erstellt',
+      header: t('privleg.colCreated'),
       align: 'right',
       width: 120,
       sortable: true,
@@ -126,7 +126,7 @@ export function InvitesTab({ api, ui }: ServiceContextProps) {
     },
     {
       key: 'expires',
-      header: 'Läuft ab',
+      header: t('privleg.colExpires'),
       align: 'right',
       width: 120,
       render: (i) => (
@@ -143,7 +143,7 @@ export function InvitesTab({ api, ui }: ServiceContextProps) {
       render: (i) =>
         i.state === 'active' ? (
           <Button variant="secondary" size="sm" onClick={() => revoke(i)}>
-            Widerrufen
+            {t('privleg.revokeInvite')}
           </Button>
         ) : null,
     },
@@ -151,21 +151,21 @@ export function InvitesTab({ api, ui }: ServiceContextProps) {
 
   return (
     <Stack gap={4}>
-      <Panel title="Neuen Einladungscode erzeugen" className="p-4">
+      <Panel title={t('privleg.createPanelTitle')} className="p-4">
         <Stack gap={3}>
           <Text variant="footnote" color="secondary">
-            Mit einem Einladungscode kann sich eine neue Person ein Konto anlegen. Der Code wird nur einmal angezeigt.
+            {t('privleg.createPanelIntro')}
           </Text>
           <Stack direction="row" gap={3} align="end" wrap>
-            <Field label="Notiz (optional)" hint="Wofür oder für wen ist dieser Code?" className="flex-1 min-w-[200px]">
+            <Field label={t('privleg.fieldNote')} hint={t('privleg.fieldNoteHint')} className="flex-1 min-w-[200px]">
               <Input
                 value={note}
                 onChange={(e) => setNote(e.target.value)}
-                placeholder="z. B. für Oma"
+                placeholder={t('privleg.notePlaceholder')}
                 maxLength={200}
               />
             </Field>
-            <Field label="Gültig für (Tage)" hint="0 = unbegrenzt" className="w-[160px]">
+            <Field label={t('privleg.fieldValidDays')} hint={t('privleg.fieldValidHint')} className="w-[160px]">
               <Input
                 value={days}
                 onChange={(e) => setDays(e.target.value.replace(/[^0-9]/g, ''))}
@@ -174,7 +174,7 @@ export function InvitesTab({ api, ui }: ServiceContextProps) {
               />
             </Field>
             <Button variant="primary" loading={busy} onClick={create}>
-              Code erzeugen
+              {t('privleg.createCode')}
             </Button>
           </Stack>
         </Stack>
@@ -189,19 +189,19 @@ export function InvitesTab({ api, ui }: ServiceContextProps) {
           rowKey={(i) => i.id}
           initialSort={{ key: 'created', dir: 'desc' }}
           maxHeight={560}
-          emptyState={<EmptyState title="Keine Einladungen" description="Es wurden noch keine Einladungscodes erzeugt." />}
+          emptyState={<EmptyState title={t('privleg.noInvites')} description={t('privleg.noInvitesDesc')} />}
         />
       )}
 
       <Modal
         open={created !== null}
         onOpenChange={(o) => !o && setCreated(null)}
-        title="Einladungscode erstellt"
-        description="Gib diesen Code an die Person weiter. Er wird nur jetzt angezeigt — danach lässt er sich nicht mehr einsehen."
+        title={t('privleg.createdModalTitle')}
+        description={t('privleg.createdModalDesc')}
         size="sm"
         footer={
           <Button variant="primary" onClick={() => setCreated(null)}>
-            Fertig
+            {t('privleg.done')}
           </Button>
         }
       >

@@ -135,13 +135,32 @@ type userOut struct {
 }
 
 func (s *Server) listUsers(w http.ResponseWriter, _ *http.Request, _ *auth.User) {
-	declared := s.cat.DeclaredSet()
 	all := s.ul.List()
 	out := make([]userOut, 0, len(all))
 	for _, u := range all {
-		out = append(out, userOut{u.Username, u.DisplayName, u.IsAdmin, filterDeclared(u.Groups, declared)})
+		out = append(out, userOut{u.Username, u.DisplayName, u.IsAdmin, s.rightsFor(u)})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"users": out})
+}
+
+// rightsFor returns the declared rights a user currently holds: the backing groups they
+// belong to, plus any shell-permission keys when their login shell is enabled (the single
+// source of truth). Shell perms have no group, so they are reported by their "svc:cat:id".
+func (s *Server) rightsFor(u users.User) []string {
+	out := filterDeclared(u.Groups, s.cat.DeclaredSet())
+	if shellSet := s.cat.ShellPermSet(); len(shellSet) > 0 && users.ShellEnabled(u.Username) {
+		for k := range shellSet {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// outFor builds the per-user response (identity + currently held rights).
+func (s *Server) outFor(name string) userOut {
+	u := s.ul.Resolve(name)
+	return userOut{u.Username, u.DisplayName, u.IsAdmin, s.rightsFor(u)}
 }
 
 func (s *Server) getCatalog(w http.ResponseWriter, _ *http.Request, _ *auth.User) {
@@ -162,8 +181,7 @@ func (s *Server) getGrants(w http.ResponseWriter, r *http.Request, _ *auth.User)
 		writeErr(w, http.StatusNotFound, "Unknown user")
 		return
 	}
-	u := s.ul.Resolve(name)
-	writeJSON(w, http.StatusOK, userOut{u.Username, u.DisplayName, u.IsAdmin, filterDeclared(u.Groups, s.cat.DeclaredSet())})
+	writeJSON(w, http.StatusOK, s.outFor(name))
 }
 
 func (s *Server) putGrants(w http.ResponseWriter, r *http.Request, caller *auth.User) {
@@ -184,37 +202,51 @@ func (s *Server) putGrants(w http.ResponseWriter, r *http.Request, caller *auth.
 		return
 	}
 
-	// Desired set: every requested group must be a declared right.
-	desired := map[string]bool{}
+	declared := s.cat.DeclaredSet()
+	shellSet := s.cat.ShellPermSet()
+
+	// Classify the desired set: every requested right is a declared group OR a declared
+	// shell-permission key (svc:cat:id). The shell perm has no group — it maps to the
+	// user's login shell (single source of truth), toggled via store.SetShell.
+	desiredGroups := map[string]bool{}
+	desiredShell := false
+	shellKey := ""
 	for _, g := range body.Rights {
-		if !s.cat.IsDeclared(g) {
+		switch {
+		case declared[g]:
+			desiredGroups[g] = true
+		case shellSet[g]:
+			desiredShell = true
+			shellKey = g
+		default:
 			writeErr(w, http.StatusBadRequest, "Unknown right: "+g)
 			return
 		}
-		desired[g] = true
 	}
-	declared := s.cat.DeclaredSet()
+
 	current := map[string]bool{}
 	for _, g := range filterDeclared(s.ul.Resolve(name).Groups, declared) {
 		current[g] = true
 	}
+	shellOn := users.ShellEnabled(name)
 
-	// Diff into add/remove changes.
+	// Diff group memberships into add/remove changes.
 	type change struct {
 		group string
 		on    bool
 	}
 	var changes []change
-	for g := range desired {
+	for g := range desiredGroups {
 		if !current[g] {
 			changes = append(changes, change{g, true})
 		}
 	}
 	for g := range current {
-		if !desired[g] {
+		if !desiredGroups[g] {
 			changes = append(changes, change{g, false})
 		}
 	}
+	shellChanged := desiredShell != shellOn
 
 	// Authorize EVERY change before applying ANY (no partial escalation).
 	for _, ch := range changes {
@@ -224,7 +256,22 @@ func (s *Server) putGrants(w http.ResponseWriter, r *http.Request, caller *auth.
 			return
 		}
 	}
-	// Apply.
+	if shellChanged {
+		key := shellKey
+		if key == "" { // turning the shell OFF: no desired key, use any declared one
+			for k := range shellSet {
+				key = k
+				break
+			}
+		}
+		svc, _ := s.cat.ShellServiceOf(key)
+		if !s.canManageService(caller, svc) {
+			writeErr(w, http.StatusForbidden, "You are not allowed to manage "+svc+" rights")
+			return
+		}
+	}
+
+	// Apply: group changes first, then the shell change.
 	for _, ch := range changes {
 		if err := store.SetGrant(name, ch.group, ch.on); err != nil {
 			log.Printf("privleg: set grant %s %s=%v failed: %v", name, ch.group, ch.on, err)
@@ -232,8 +279,14 @@ func (s *Server) putGrants(w http.ResponseWriter, r *http.Request, caller *auth.
 			return
 		}
 	}
-	u := s.ul.Resolve(name)
-	writeJSON(w, http.StatusOK, userOut{u.Username, u.DisplayName, u.IsAdmin, filterDeclared(u.Groups, declared)})
+	if shellChanged {
+		if err := store.SetShell(name, desiredShell); err != nil {
+			log.Printf("privleg: set shell %s=%v failed: %v", name, desiredShell, err)
+			writeErr(w, http.StatusInternalServerError, "Failed to apply shell change")
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, s.outFor(name))
 }
 
 func (s *Server) setAdmin(w http.ResponseWriter, r *http.Request, caller *auth.User) {
@@ -262,8 +315,7 @@ func (s *Server) setAdmin(w http.ResponseWriter, r *http.Request, caller *auth.U
 		writeErr(w, http.StatusInternalServerError, "Failed to change admin status")
 		return
 	}
-	u := s.ul.Resolve(name)
-	writeJSON(w, http.StatusOK, userOut{u.Username, u.DisplayName, u.IsAdmin, filterDeclared(u.Groups, s.cat.DeclaredSet())})
+	writeJSON(w, http.StatusOK, s.outFor(name))
 }
 
 func (s *Server) refresh(w http.ResponseWriter, _ *http.Request, _ *auth.User) {

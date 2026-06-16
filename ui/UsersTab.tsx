@@ -9,6 +9,7 @@ import {
   Switch,
   Text,
   useLiveQuery,
+  useT,
   type Column,
   type ServiceContextProps,
 } from '@holistic/ui';
@@ -19,6 +20,7 @@ interface Props extends ServiceContextProps {
 }
 
 export function UsersTab({ api, ui, user, onEdit }: Props) {
+  const t = useT();
   const { data, refresh } = useLiveQuery<UsersResponse>(() => api.get<UsersResponse>('users'), 5000);
   const [q, setQ] = useState('');
 
@@ -33,27 +35,25 @@ export function UsersTab({ api, ui, user, onEdit }: Props) {
 
   async function toggleAdmin(target: PrivlegUser, next: boolean) {
     const ok = await ui.confirm({
-      title: next ? `${target.displayName} zum Admin machen?` : `Admin-Rechte von ${target.displayName} entziehen?`,
-      description: next
-        ? 'Admins haben uneingeschränkten Zugriff auf alle Dienste und können Rechte verwalten.'
-        : 'Der Benutzer verliert den uneingeschränkten Zugriff. Feingranulare Rechte bleiben erhalten.',
+      title: next ? t('privleg.makeAdminTitle', { name: target.displayName }) : t('privleg.revokeAdminTitle', { name: target.displayName }),
+      description: next ? t('privleg.makeAdminDesc') : t('privleg.revokeAdminDesc'),
       danger: !next,
-      confirmLabel: next ? 'Zum Admin machen' : 'Entziehen',
+      confirmLabel: next ? t('privleg.makeAdmin') : t('privleg.revokeAdmin'),
     });
     if (!ok) return;
     try {
       await api.put(`users/${target.username}/admin`, { admin: next });
-      ui.toast({ title: 'Aktualisiert', variant: 'success' });
+      ui.toast({ title: t('privleg.updated'), variant: 'success' });
       refresh();
     } catch (e) {
-      ui.toast({ title: 'Konnte nicht ändern', description: (e as Error).message, variant: 'error' });
+      ui.toast({ title: t('privleg.changeFailed'), description: (e as Error).message, variant: 'error' });
     }
   }
 
   const columns: Column<PrivlegUser>[] = [
     {
       key: 'displayName',
-      header: 'Benutzer',
+      header: t('privleg.colUser'),
       sortable: true,
       sortValue: (u) => u.displayName.toLowerCase(),
       hideable: false,
@@ -68,19 +68,19 @@ export function UsersTab({ api, ui, user, onEdit }: Props) {
     },
     {
       key: 'admin',
-      header: 'Admin',
+      header: t('privleg.colAdmin'),
       align: 'right',
       width: 96,
       render: (u) => <Switch checked={u.isAdmin} disabled={!canToggleAdmin(u)} onChange={(next) => toggleAdmin(u, next)} />,
     },
     {
       key: 'rights',
-      header: 'Rechte',
+      header: t('privleg.colRights'),
       align: 'right',
       width: 110,
       sortable: true,
       sortValue: (u) => (u.isAdmin ? Number.MAX_SAFE_INTEGER : u.rights.length),
-      render: (u) => (u.isAdmin ? <Badge variant="accent">alle</Badge> : <Badge variant="neutral">{String(u.rights.length)}</Badge>),
+      render: (u) => (u.isAdmin ? <Badge variant="accent">{t('privleg.rightsAll')}</Badge> : <Badge variant="neutral">{String(u.rights.length)}</Badge>),
     },
     {
       key: 'edit',
@@ -89,7 +89,7 @@ export function UsersTab({ api, ui, user, onEdit }: Props) {
       width: 168,
       render: (u) => (
         <Button variant="secondary" size="sm" disabled={u.isAdmin} onClick={() => onEdit(u.username)}>
-          Rechte bearbeiten
+          {t('privleg.editRights')}
         </Button>
       ),
     },
@@ -99,9 +99,9 @@ export function UsersTab({ api, ui, user, onEdit }: Props) {
     <Stack gap={3}>
       <Stack direction="row" align="center" justify="between" gap={3}>
         <Text variant="subhead" weight="semibold">
-          {String(rows.length)} Benutzer
+          {t('privleg.userCount', { count: rows.length })}
         </Text>
-        <SearchField value={q} onChange={setQ} placeholder="Nach Name oder Benutzer filtern" />
+        <SearchField value={q} onChange={setQ} placeholder={t('privleg.filterUsers')} />
       </Stack>
       <DataTable
         columns={columns}
@@ -109,7 +109,7 @@ export function UsersTab({ api, ui, user, onEdit }: Props) {
         rowKey={(u) => u.username}
         initialSort={{ key: 'displayName', dir: 'asc' }}
         maxHeight={560}
-        emptyState={<EmptyState title="Keine Benutzer" description="Es wurden keine holistic-Benutzer gefunden." />}
+        emptyState={<EmptyState title={t('privleg.noUsers')} description={t('privleg.noUsersDesc')} />}
       />
     </Stack>
   );

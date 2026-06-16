@@ -1,5 +1,6 @@
 import { UserIcon, type HolisticUser, type ServicePlugin } from '@holistic/ui';
 import { Dashboard } from './Dashboard';
+import './i18n';
 
 // Visible to admins and to non-admins holding a privleg right: the view right, a delegated
 // manager right (hp_priv_dlg_*), or the invite-management right (hp_priv_invite).
@@ -14,7 +15,7 @@ function canSeePrivleg(user: HolisticUser): boolean {
 // time and discovered by the host SPA's build-time registry. id MUST equal the link dir.
 const plugin: ServicePlugin = {
   id: 'privleg',
-  displayName: 'Rechte',
+  displayName: 'Permissions',
   icon: UserIcon,
   order: 5,
   visible: canSeePrivleg,

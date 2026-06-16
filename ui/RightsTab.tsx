@@ -7,6 +7,7 @@ import {
   Switch,
   Text,
   useLiveQuery,
+  useT,
   type ServiceContextProps,
 } from '@holistic/ui';
 import type { CatalogResponse, GrantsResponse } from './types';
@@ -17,6 +18,7 @@ interface Props extends ServiceContextProps {
 }
 
 export function RightsTab({ api, ui, user, username, onBack }: Props) {
+  const t = useT();
   const cat = useLiveQuery<CatalogResponse>(() => api.get<CatalogResponse>('catalog'), 30000);
   const grants = useLiveQuery<GrantsResponse>(() => api.get<GrantsResponse>(`users/${username}/grants`), 5000);
 
@@ -24,7 +26,7 @@ export function RightsTab({ api, ui, user, username, onBack }: Props) {
   const target = grants.data;
 
   if (!target) {
-    return grants.loading ? <Spinner /> : <Text color="danger">Konnte die Rechte nicht laden.</Text>;
+    return grants.loading ? <Spinner /> : <Text color="danger">{t('privleg.loadRightsError')}</Text>;
   }
 
   const held = new Set(target.rights);
@@ -40,19 +42,19 @@ export function RightsTab({ api, ui, user, username, onBack }: Props) {
   const toggle = async (group: string, label: string, dangerous: boolean, next: boolean) => {
     if (dangerous && next) {
       const ok = await ui.confirm({
-        title: `„${label}" gewähren?`,
-        description: 'Dieses Recht erlaubt eine potenziell weitreichende Aktion.',
-        confirmLabel: 'Gewähren',
+        title: t('privleg.grantTitle', { label }),
+        description: t('privleg.grantDesc'),
+        confirmLabel: t('privleg.grant'),
       });
       if (!ok) return;
     }
     const nextRights = next ? [...target.rights, group] : target.rights.filter((g) => g !== group);
     try {
       await api.put(`users/${username}/grants`, { rights: nextRights });
-      ui.toast({ title: 'Rechte aktualisiert', variant: 'success' });
+      ui.toast({ title: t('privleg.rightsUpdated'), variant: 'success' });
       grants.refresh();
     } catch (e) {
-      ui.toast({ title: 'Konnte nicht speichern', description: (e as Error).message, variant: 'error' });
+      ui.toast({ title: t('privleg.saveFailed'), description: (e as Error).message, variant: 'error' });
     }
   };
 
@@ -61,7 +63,7 @@ export function RightsTab({ api, ui, user, username, onBack }: Props) {
       <Stack direction="row" align="center" justify="between" gap={3}>
         <Stack direction="row" align="center" gap={3}>
           <Button variant="ghost" size="sm" onClick={onBack}>
-            ← Zurück
+            {t('privleg.back')}
           </Button>
           <Stack gap={0}>
             <Text variant="subhead" weight="semibold">
@@ -72,17 +74,16 @@ export function RightsTab({ api, ui, user, username, onBack }: Props) {
             </Text>
           </Stack>
         </Stack>
-        {target.isAdmin && <Badge variant="accent">Admin — voller Zugriff</Badge>}
+        {target.isAdmin && <Badge variant="accent">{t('privleg.adminFullAccess')}</Badge>}
       </Stack>
 
       {target.isAdmin && (
         <Text variant="footnote" color="secondary">
-          Admins haben uneingeschränkten Zugriff. Feingranulare Rechte gelten nur für Nicht-Admins — entziehe den
-          Admin-Status, um sie einzeln zu steuern.
+          {t('privleg.adminNote')}
         </Text>
       )}
 
-      {services.length === 0 && <Text color="secondary">Kein Dienst deklariert Rechte.</Text>}
+      {services.length === 0 && <Text color="secondary">{t('privleg.noServiceRights')}</Text>}
 
       {services.flatMap((svc) =>
         svc.categories.map((c) => (
@@ -94,17 +95,21 @@ export function RightsTab({ api, ui, user, username, onBack }: Props) {
                 </Text>
               )}
               {c.permissions.map((p) => {
-                const on = target.isAdmin || held.has(p.group);
+                // A right's storage key: a backing group for normal rights, or the
+                // fully-qualified id "svc:cat:id" for a shell permission (no group — the
+                // user's login shell is the single source of truth, toggled by the backend).
+                const key = p.type === 'shell' ? `${svc.service}:${c.id}:${p.id}` : (p.group ?? '');
+                const on = target.isAdmin || held.has(key);
                 const disabled = target.isAdmin || !canManage(svc.service);
                 return (
-                  <Stack key={p.group} direction="row" align="center" justify="between" gap={3}>
+                  <Stack key={key} direction="row" align="center" justify="between" gap={3}>
                     <Stack gap={1}>
                       <Stack direction="row" align="center" gap={2}>
                         <Text weight="semibold">{p.label}</Text>
-                        {p.dangerous && <Badge variant="warning">heikel</Badge>}
-                        {/* orange (the `net` token), distinct from heikel's amber `warning` */}
-                        {p.sensitive && <Badge className="bg-net/15 text-net">sensibel</Badge>}
-                        {p.default && <Badge variant="neutral">Standard: an</Badge>}
+                        {p.dangerous && <Badge variant="warning">{t('privleg.badgeDangerous')}</Badge>}
+                        {/* orange (the `net` token), distinct from the dangerous badge's amber `warning` */}
+                        {p.sensitive && <Badge className="bg-net/15 text-net">{t('privleg.badgeSensitive')}</Badge>}
+                        {p.default && <Badge variant="neutral">{t('privleg.badgeDefaultOn')}</Badge>}
                       </Stack>
                       {p.description && (
                         <Text variant="footnote" color="secondary">
@@ -112,7 +117,7 @@ export function RightsTab({ api, ui, user, username, onBack }: Props) {
                         </Text>
                       )}
                     </Stack>
-                    <Switch checked={on} disabled={disabled} onChange={(next) => toggle(p.group, p.label, !!p.dangerous, next)} />
+                    <Switch checked={on} disabled={disabled} onChange={(next) => toggle(key, p.label, !!p.dangerous, next)} />
                   </Stack>
                 );
               })}
