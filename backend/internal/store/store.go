@@ -11,9 +11,10 @@ import (
 )
 
 const (
-	grantWrapper = "/usr/local/sbin/privleg-grant"
-	adminWrapper = "/usr/local/sbin/privleg-set-admin"
-	shellWrapper = "/usr/local/sbin/privleg-set-shell"
+	grantWrapper  = "/usr/local/sbin/privleg-grant"
+	adminWrapper  = "/usr/local/sbin/privleg-set-admin"
+	shellWrapper  = "/usr/local/sbin/privleg-set-shell"
+	deleteWrapper = "/usr/local/sbin/privleg-delete-user"
 )
 
 func onOff(on bool) string {
@@ -53,4 +54,16 @@ func SetAdmin(username string, on bool) error {
 // side of the "login shell is the single source of truth for shell access" model.
 func SetShell(username string, on bool) error {
 	return run(shellWrapper, username, onOff(on))
+}
+
+// DeleteUser removes a holistic-managed user's Samba + Linux account via the narrow root
+// wrapper; purge also removes their home tree (userdel -r). The wrapper fails closed: it
+// refuses any account that is not a member of the holistic users group AND any account in the
+// admin group, so this can never delete a system, infrastructure, or admin account even if
+// called with one.
+func DeleteUser(username string, purge bool) error {
+	if purge {
+		return run(deleteWrapper, username, "--purge")
+	}
+	return run(deleteWrapper, username)
 }

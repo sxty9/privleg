@@ -73,6 +73,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+base+"users/{username}/grants", s.guard(s.isManager, false, s.getGrants))
 	mux.HandleFunc("PUT "+base+"users/{username}/grants", s.guard(s.isManager, true, s.putGrants))
 	mux.HandleFunc("PUT "+base+"users/{username}/admin", s.guard(isAdmin, true, s.setAdmin))
+	mux.HandleFunc("DELETE "+base+"users/{username}", s.guard(isAdmin, true, s.deleteUser))
 	// Rights groups: reading is for any console manager (the editor shows assignments);
 	// defining/assigning groups is admin-only (a group can bundle cross-service rights).
 	mux.HandleFunc("GET "+base+"groups", s.guard(s.isManager, false, s.listGroups))
@@ -378,6 +379,49 @@ func (s *Server) setAdmin(w http.ResponseWriter, r *http.Request, caller *auth.U
 		log.Printf("privleg: re-materialize %s after admin change: %v", name, err)
 	}
 	writeJSON(w, http.StatusOK, s.outFor(name))
+}
+
+// deleteUser deletes a holistic-managed account (admin-only, CSRF-guarded). It refuses to
+// delete the caller's own account and only ever targets a managed user; the underlying root
+// wrapper additionally refuses anything that is not a holistic user. ?purge=true also removes
+// the user's home tree. The user's privleg rights config is dropped too.
+func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request, caller *auth.User) {
+	name := r.PathValue("username")
+	if !userRe.MatchString(name) {
+		writeErr(w, http.StatusBadRequest, "Invalid username")
+		return
+	}
+	if !s.ul.IsManaged(name) {
+		writeErr(w, http.StatusNotFound, "Unknown user")
+		return
+	}
+	if name == caller.Username {
+		writeErr(w, http.StatusBadRequest, "You cannot delete your own account")
+		return
+	}
+	// Never delete an admin account — admin status must be revoked first. Mirrors the
+	// admin-target refusal in putGrants and the wrapper's own admin-group guard, so deletion
+	// can't bypass the checks-and-balances the rest of privleg preserves.
+	if s.ul.Resolve(name).IsAdmin {
+		writeErr(w, http.StatusBadRequest, "Cannot delete an admin account — revoke admin status first")
+		return
+	}
+	purge := r.URL.Query().Get("purge") == "true"
+	// Drop the user's privleg rights config FIRST. It is reversible, so a failed cleanup aborts
+	// BEFORE the irreversible OS deletion; and a later same-name account can never inherit stale
+	// group assignments/overrides. (If the OS delete then fails, the account simply re-imports
+	// its live rights on next edit — no resurrection, no orphaned config.)
+	if err := s.rs.DeleteUser(name); err != nil {
+		log.Printf("privleg: drop rights config for %s failed: %v", name, err)
+		writeErr(w, http.StatusInternalServerError, "Failed to delete the account")
+		return
+	}
+	if err := store.DeleteUser(name, purge); err != nil {
+		log.Printf("privleg: delete user %s (purge=%v) failed: %v", name, purge, err)
+		writeErr(w, http.StatusInternalServerError, "Failed to delete the account")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) refresh(w http.ResponseWriter, _ *http.Request, _ *auth.User) {

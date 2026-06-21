@@ -222,6 +222,23 @@ func (s *Store) SetUser(name string, cfg UserConfig) error {
 	return nil
 }
 
+// DeleteUser drops a user's stored config (e.g. when their account is deleted), so a later
+// same-name account never inherits stale assignments/overrides. A missing entry is a no-op.
+func (s *Store) DeleteUser(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev, ok := s.st.Users[name]
+	if !ok {
+		return nil
+	}
+	delete(s.st.Users, name)
+	if err := s.save(); err != nil {
+		s.st.Users[name] = prev
+		return err
+	}
+	return nil
+}
+
 // membersOf returns the usernames assigned to a group id. Caller must hold s.mu.
 func (s *Store) membersOf(id string) []string {
 	var out []string

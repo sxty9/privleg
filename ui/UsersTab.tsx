@@ -2,8 +2,10 @@ import { useState } from 'react';
 import {
   Badge,
   Button,
+  Checkbox,
   DataTable,
   EmptyState,
+  Modal,
   SearchField,
   Stack,
   Switch,
@@ -23,6 +25,9 @@ export function UsersTab({ api, ui, user, onEdit }: Props) {
   const t = useT();
   const { data, refresh } = useLiveQuery<UsersResponse>(() => api.get<UsersResponse>('users'), 5000);
   const [q, setQ] = useState('');
+  const [del, setDel] = useState<PrivlegUser | null>(null);
+  const [purge, setPurge] = useState(false);
+  const [busy, setBusy] = useState(false);
 
   const all = data?.users ?? [];
   const needle = q.trim().toLowerCase();
@@ -47,6 +52,26 @@ export function UsersTab({ api, ui, user, onEdit }: Props) {
       refresh();
     } catch (e) {
       ui.toast({ title: t('privleg.changeFailed'), description: (e as Error).message, variant: 'error' });
+    }
+  }
+
+  // Account deletion is admin-only, never on yourself, and never on another admin (revoke
+  // their admin status first). The backend + the root wrapper enforce all three.
+  const canDelete = (u: PrivlegUser) => user.isAdmin && u.username !== user.username && !u.isAdmin;
+
+  async function confirmDelete() {
+    if (!del) return;
+    setBusy(true);
+    try {
+      await api.del(`users/${del.username}${purge ? '?purge=true' : ''}`);
+      ui.toast({ title: t('privleg.accountDeleted'), variant: 'success' });
+      setDel(null);
+      setPurge(false);
+      refresh();
+    } catch (e) {
+      ui.toast({ title: t('privleg.deleteFailed'), description: (e as Error).message, variant: 'error' });
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -83,14 +108,21 @@ export function UsersTab({ api, ui, user, onEdit }: Props) {
       render: (u) => (u.isAdmin ? <Badge variant="accent">{t('privleg.rightsAll')}</Badge> : <Badge variant="neutral">{String(u.rights.length)}</Badge>),
     },
     {
-      key: 'edit',
+      key: 'actions',
       header: '',
       align: 'right',
-      width: 168,
+      width: 260,
       render: (u) => (
-        <Button variant="secondary" size="sm" disabled={u.isAdmin} onClick={() => onEdit(u.username)}>
-          {t('privleg.editRights')}
-        </Button>
+        <Stack direction="row" gap={2} justify="end">
+          <Button variant="secondary" size="sm" disabled={u.isAdmin} onClick={() => onEdit(u.username)}>
+            {t('privleg.editRights')}
+          </Button>
+          {canDelete(u) && (
+            <Button variant="ghost" size="sm" onClick={() => { setPurge(false); setDel(u); }}>
+              {t('privleg.deleteAccount')}
+            </Button>
+          )}
+        </Stack>
       ),
     },
   ];
@@ -111,6 +143,36 @@ export function UsersTab({ api, ui, user, onEdit }: Props) {
         maxHeight={560}
         emptyState={<EmptyState title={t('privleg.noUsers')} description={t('privleg.noUsersDesc')} />}
       />
+
+      <Modal
+        open={del !== null}
+        onOpenChange={(o) => {
+          if (!o) {
+            setDel(null);
+            setPurge(false);
+          }
+        }}
+        title={t('privleg.deleteAccountTitle', { name: del?.displayName ?? '' })}
+        description={t('privleg.deleteAccountDesc')}
+        size="sm"
+        footer={
+          <Stack direction="row" gap={2} justify="end">
+            <Button variant="secondary" onClick={() => { setDel(null); setPurge(false); }}>
+              {t('privleg.cancel')}
+            </Button>
+            <Button variant="destructive" loading={busy} onClick={confirmDelete}>
+              {t('privleg.deleteAccount')}
+            </Button>
+          </Stack>
+        }
+      >
+        <Stack gap={2}>
+          <Checkbox checked={purge} onChange={setPurge} label={t('privleg.deleteAccountPurge')} />
+          <Text variant="footnote" color="secondary">
+            {t('privleg.deleteAccountPurgeHint')}
+          </Text>
+        </Stack>
+      </Modal>
     </Stack>
   );
 }

@@ -108,6 +108,28 @@ func TestSetUserNormalizesAndRoundtrips(t *testing.T) {
 	}
 }
 
+func TestDeleteUser(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rights.json")
+	s, _ := Open(path)
+	if err := s.SetUser("carol", UserConfig{Overrides: map[string]string{"hp_x": "on"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteUser("carol"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.GetUser("carol"); ok {
+		t.Error("config should be gone after DeleteUser")
+	}
+	if err := s.DeleteUser("nobody"); err != nil {
+		t.Errorf("deleting a missing user must be a no-op, got %v", err)
+	}
+	// Deletion persists across reopen.
+	s2, _ := Open(path)
+	if _, ok := s2.GetUser("carol"); ok {
+		t.Error("deletion must persist")
+	}
+}
+
 func reflect_equalStrings(a, b []string) bool {
 	a = append([]string{}, a...)
 	b = append([]string{}, b...)
