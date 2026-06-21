@@ -19,6 +19,7 @@ import (
 	"privleg/internal/api"
 	"privleg/internal/auth"
 	"privleg/internal/catalog"
+	"privleg/internal/rights"
 	"privleg/internal/users"
 )
 
@@ -36,8 +37,20 @@ func main() {
 	cat := catalog.New(*permsDir)
 	ul := users.NewLister(os.Getenv("PRIVLEG_USERS_GROUP"), adminGroup)
 
+	// The rights config layer (groups + per-user assignments/overrides) is privleg-private
+	// state; the materializer resolves it and syncs it down to live Linux groups.
+	rpath := os.Getenv("PRIVLEG_RIGHTS")
+	if rpath == "" {
+		rpath = rights.DefaultPath
+	}
+	rstore, err := rights.Open(rpath)
+	if err != nil {
+		log.Fatalf("privlegd: open rights store %s: %v", rpath, err)
+	}
+	mat := rights.NewMaterializer(rstore, cat, ul)
+
 	srv := &http.Server{
-		Handler:           api.New(v, cat, ul).Handler(),
+		Handler:           api.New(v, cat, ul, rstore, mat).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

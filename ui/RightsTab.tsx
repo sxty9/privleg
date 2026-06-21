@@ -1,40 +1,46 @@
 import {
   Badge,
+  Box,
   Button,
+  Checkbox,
   Panel,
+  SegmentedControl,
   Spinner,
   Stack,
-  Switch,
   Text,
   useLiveQuery,
   useT,
+  type SegmentedOption,
   type ServiceContextProps,
 } from '@holistic/ui';
-import type { CatalogResponse, GrantsResponse } from './types';
+import { RightsCatalog, type CatalogRight } from './RightsCatalog';
+import type { CatalogResponse, GrantsResponse, GroupsResponse, OverrideState } from './types';
 
 interface Props extends ServiceContextProps {
   username: string;
   onBack: () => void;
 }
 
+// The three states of a per-right switch: force-off, inherit-from-groups, force-on.
+type TriState = 'off' | 'group' | 'on';
+
 export function RightsTab({ api, ui, user, username, onBack }: Props) {
   const t = useT();
   const cat = useLiveQuery<CatalogResponse>(() => api.get<CatalogResponse>('catalog'), 30000);
+  const grps = useLiveQuery<GroupsResponse>(() => api.get<GroupsResponse>('groups'), 30000);
   const grants = useLiveQuery<GrantsResponse>(() => api.get<GrantsResponse>(`users/${username}/grants`), 5000);
 
   const services = cat.data?.services ?? [];
+  const groups = grps.data?.groups ?? [];
   const target = grants.data;
 
   if (!target) {
     return grants.loading ? <Spinner /> : <Text color="danger">{t('privleg.loadRightsError')}</Text>;
   }
 
-  const held = new Set(target.rights);
-
-  // Rights labels come from each service's manifest (server data, authored in one
-  // language). We localize them by their stable id — service / category / permission —
-  // and fall back to whatever the manifest shipped for rights we don't have a key for.
-  const tr = (key: string, fallback: string) => (t.has(key) ? t(key) : fallback);
+  const assigned = new Set(target.groups);
+  const inherited = new Set(target.inherited);
+  const overrides = target.overrides;
 
   // May the calling user manage rights of this service for others? Admins always; a
   // delegated manager only for its service; privleg's own meta-rights are admin-only.
@@ -44,23 +50,52 @@ export function RightsTab({ api, ui, user, username, onBack }: Props) {
     return user.groups.includes(`hp_priv_dlg_${service}`);
   }
 
-  const toggle = async (group: string, label: string, dangerous: boolean, next: boolean) => {
-    if (dangerous && next) {
+  // Persist the full desired config (the backend diffs + authorizes each change).
+  async function save(nextGroups: string[], nextOverrides: Record<string, OverrideState>) {
+    try {
+      await api.put(`users/${username}/grants`, { groups: nextGroups, overrides: nextOverrides });
+      ui.toast({ title: t('privleg.rightsUpdated'), variant: 'success' });
+      grants.refresh();
+    } catch (e) {
+      ui.toast({ title: t('privleg.saveFailed'), description: (e as Error).message, variant: 'error' });
+      grants.refresh(); // re-sync the UI to the server's actual state on failure
+    }
+  }
+
+  async function toggleGroup(id: string, next: boolean) {
+    const nextGroups = next ? [...target!.groups, id] : target!.groups.filter((g) => g !== id);
+    await save(nextGroups, overrides);
+  }
+
+  async function setTri(right: CatalogRight, next: TriState) {
+    if (next === 'on' && right.perm.dangerous) {
       const ok = await ui.confirm({
-        title: t('privleg.grantTitle', { label }),
+        title: t('privleg.grantTitle', { label: right.label }),
         description: t('privleg.grantDesc'),
         confirmLabel: t('privleg.grant'),
       });
       if (!ok) return;
     }
-    const nextRights = next ? [...target.rights, group] : target.rights.filter((g) => g !== group);
-    try {
-      await api.put(`users/${username}/grants`, { rights: nextRights });
-      ui.toast({ title: t('privleg.rightsUpdated'), variant: 'success' });
-      grants.refresh();
-    } catch (e) {
-      ui.toast({ title: t('privleg.saveFailed'), description: (e as Error).message, variant: 'error' });
-    }
+    const nextOverrides: Record<string, OverrideState> = { ...overrides };
+    if (next === 'group') delete nextOverrides[right.key];
+    else nextOverrides[right.key] = next;
+    await save(target!.groups, nextOverrides);
+  }
+
+  const triControl = (right: CatalogRight) => {
+    const value: TriState = overrides[right.key] ?? 'group';
+    const groupYields = inherited.has(right.key);
+    const disabled = target!.isAdmin || !canManage(right.service);
+    const options: SegmentedOption<TriState>[] = [
+      { value: 'off', label: t('privleg.triOff') },
+      { value: 'group', label: groupYields ? t('privleg.triGroupOn') : t('privleg.triGroupOff') },
+      { value: 'on', label: t('privleg.triOn') },
+    ];
+    return (
+      <Box className={disabled ? 'pointer-events-none opacity-50' : undefined}>
+        <SegmentedControl options={options} value={value} onChange={(v) => setTri(right, v)} />
+      </Box>
+    );
   };
 
   return (
@@ -88,48 +123,38 @@ export function RightsTab({ api, ui, user, username, onBack }: Props) {
         </Text>
       )}
 
-      {services.length === 0 && <Text color="secondary">{t('privleg.noServiceRights')}</Text>}
-
-      {services.flatMap((svc) =>
-        svc.categories.map((c) => (
-          <Panel key={`${svc.service}:${c.id}`} title={`${tr(`rights.cat.${svc.service}.${c.id}`, c.label)} · ${tr(`service.${svc.service}`, svc.service)}`} className="p-4">
-            <Stack gap={3}>
-              {c.description && (
-                <Text variant="footnote" color="secondary">
-                  {tr(`rights.catdesc.${svc.service}.${c.id}`, c.description)}
-                </Text>
-              )}
-              {c.permissions.map((p) => {
-                // A right's storage key: a backing group for normal rights, or the
-                // fully-qualified id "svc:cat:id" for a shell permission (no group — the
-                // user's login shell is the single source of truth, toggled by the backend).
-                const key = p.type === 'shell' ? `${svc.service}:${c.id}:${p.id}` : (p.group ?? '');
-                const on = target.isAdmin || held.has(key);
-                const disabled = target.isAdmin || !canManage(svc.service);
-                return (
-                  <Stack key={key} direction="row" align="center" justify="between" gap={3}>
-                    <Stack gap={1}>
-                      <Stack direction="row" align="center" gap={2}>
-                        <Text weight="semibold">{tr(`rights.perm.${svc.service}.${c.id}.${p.id}`, p.label)}</Text>
-                        {p.dangerous && <Badge variant="warning">{t('privleg.badgeDangerous')}</Badge>}
-                        {/* orange (the `net` token), distinct from the dangerous badge's amber `warning` */}
-                        {p.sensitive && <Badge className="bg-net/15 text-net">{t('privleg.badgeSensitive')}</Badge>}
-                        {p.default && <Badge variant="neutral">{t('privleg.badgeDefaultOn')}</Badge>}
-                      </Stack>
-                      {p.description && (
-                        <Text variant="footnote" color="secondary">
-                          {tr(`rights.permdesc.${svc.service}.${c.id}.${p.id}`, p.description)}
-                        </Text>
-                      )}
-                    </Stack>
-                    <Switch checked={on} disabled={disabled} onChange={(next) => toggle(key, tr(`rights.perm.${svc.service}.${c.id}.${p.id}`, p.label), !!p.dangerous, next)} />
-                  </Stack>
-                );
-              })}
+      {/* Group assignment: admins pick the groups the user belongs to; delegated managers see
+          the membership read-only (only admins may change it, mirroring the daemon). */}
+      <Panel title={t('privleg.assignGroupsTitle')} className="p-4">
+        <Stack gap={3}>
+          <Text variant="footnote" color="secondary">
+            {t('privleg.assignGroupsIntro')}
+          </Text>
+          {groups.length === 0 ? (
+            <Text variant="footnote" color="secondary">
+              {t('privleg.noGroupsYet')}
+            </Text>
+          ) : user.isAdmin && !target.isAdmin ? (
+            <Stack gap={2}>
+              {groups.map((g) => (
+                <Checkbox key={g.id} checked={assigned.has(g.id)} onChange={(next) => toggleGroup(g.id, next)} label={g.label} />
+              ))}
             </Stack>
-          </Panel>
-        )),
-      )}
+          ) : (
+            <Stack direction="row" gap={2} wrap>
+              {target.groups.length === 0 ? (
+                <Text variant="footnote" color="secondary">
+                  {t('privleg.noGroupsAssigned')}
+                </Text>
+              ) : (
+                groups.filter((g) => assigned.has(g.id)).map((g) => <Badge key={g.id} variant="neutral">{g.label}</Badge>)
+              )}
+            </Stack>
+          )}
+        </Stack>
+      </Panel>
+
+      <RightsCatalog services={services} control={triControl} emptyText={t('privleg.noServiceRights')} />
     </Stack>
   );
 }

@@ -22,12 +22,12 @@ type Perm struct {
 	Description string `json:"description,omitempty"`
 	// Type is "group" (default, backed by a Linux group) or "shell" (the user's login
 	// shell — the single source of truth — toggled via usermod; no backing group).
-	Type        string `json:"type,omitempty"`
-	Group       string `json:"group,omitempty"`
-	Shell       string `json:"shell,omitempty"` // login shell to set when a "shell" perm is granted
-	Default     bool   `json:"default,omitempty"`
-	Dangerous   bool   `json:"dangerous,omitempty"`
-	Sensitive   bool   `json:"sensitive,omitempty"`
+	Type      string `json:"type,omitempty"`
+	Group     string `json:"group,omitempty"`
+	Shell     string `json:"shell,omitempty"` // login shell to set when a "shell" perm is granted
+	Default   bool   `json:"default,omitempty"`
+	Dangerous bool   `json:"dangerous,omitempty"`
+	Sensitive bool   `json:"sensitive,omitempty"`
 }
 
 // Category groups related rights within one service.
@@ -120,6 +120,45 @@ func (c *Catalog) Manifests() []Manifest {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.manifests
+}
+
+// RightRef identifies one declared right across all manifests: a backing-group right
+// (Kind "group", Key is the hp_* group) or a shell right (Kind "shell", Key is the
+// fully-qualified "svc:cat:id"). It is the unit the rights config layer materializes.
+type RightRef struct {
+	Key     string `json:"key"`
+	Service string `json:"service"`
+	Kind    string `json:"kind"` // "group" | "shell"
+}
+
+// Rights returns every declared right (group + shell), as a snapshot. The order is not
+// significant — callers index by Key.
+func (c *Catalog) Rights() []RightRef {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]RightRef, 0, len(c.groupService)+len(c.shellService))
+	for k, svc := range c.groupService {
+		out = append(out, RightRef{Key: k, Service: svc, Kind: "group"})
+	}
+	for k, svc := range c.shellService {
+		out = append(out, RightRef{Key: k, Service: svc, Kind: "shell"})
+	}
+	return out
+}
+
+// KeyService resolves a right key (backing group or "svc:cat:id" shell key) to its
+// declaring service and kind ("group"|"shell"). It unifies ServiceOf and ShellServiceOf
+// so callers can authorize an arbitrary right key without first knowing its kind.
+func (c *Catalog) KeyService(key string) (svc, kind string, ok bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if s, ok := c.groupService[key]; ok {
+		return s, "group", true
+	}
+	if s, ok := c.shellService[key]; ok {
+		return s, "shell", true
+	}
+	return "", "", false
 }
 
 // ServiceOf returns the service that declares a backing group, and whether it is declared.

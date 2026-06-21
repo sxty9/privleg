@@ -1,10 +1,76 @@
 package api
 
 import (
+	"reflect"
 	"testing"
 
 	"privleg/internal/auth"
 )
+
+// sameSet and changedOverrides gate authorization in putGrants — a wrong answer here is an
+// escalation (a non-admin slipping a group change through, or an override change going
+// un-authorized), so they're tested directly.
+func TestSameSet(t *testing.T) {
+	cases := []struct {
+		a, b []string
+		want bool
+	}{
+		{nil, nil, true},
+		{[]string{}, nil, true},
+		{[]string{"g1"}, []string{"g1"}, true},
+		{[]string{"g1", "g2"}, []string{"g2", "g1"}, true}, // order-independent
+		{[]string{"g1", "g1"}, []string{"g1"}, true},       // dupe-independent
+		{[]string{"g1"}, []string{"g1", "g2"}, false},      // added
+		{[]string{"g1", "g2"}, []string{"g1"}, false},      // removed
+		{[]string{"g1"}, []string{"g2"}, false},            // swapped
+	}
+	for _, c := range cases {
+		if got := sameSet(c.a, c.b); got != c.want {
+			t.Errorf("sameSet(%v,%v) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+func TestChangedOverrides(t *testing.T) {
+	before := map[string]string{"hp_a": "on", "hp_b": "off"}
+	after := map[string]string{"hp_a": "on", "hp_c": "on"} // hp_b removed, hp_c added, hp_a same
+	got := changedOverrides(before, after)
+	want := map[string]bool{"hp_b": true, "hp_c": true}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("changedOverrides = %v, want %v", got, want)
+	}
+	// flip in place is a change
+	got = changedOverrides(map[string]string{"hp_a": "on"}, map[string]string{"hp_a": "off"})
+	if !got["hp_a"] {
+		t.Error("a flipped override must be detected as changed")
+	}
+	if len(changedOverrides(before, before)) != 0 {
+		t.Error("identical override maps must report no changes")
+	}
+}
+
+func TestSanitizeLabel(t *testing.T) {
+	if got := sanitizeLabel("  Eltern  "); got != "Eltern" {
+		t.Errorf("trim = %q", got)
+	}
+	if got := sanitizeLabel("a\x00b\tc"); got != "ab c" {
+		t.Errorf("control strip = %q, want %q", got, "ab c")
+	}
+	long := make([]byte, 100)
+	for i := range long {
+		long[i] = 'x'
+	}
+	if got := sanitizeLabel(string(long)); len(got) > 64 {
+		t.Errorf("label not capped: len=%d", len(got))
+	}
+}
+
+func TestDedupe(t *testing.T) {
+	got := dedupe([]string{"b", "a", "b", "a"})
+	if !reflect.DeepEqual(got, []string{"a", "b"}) {
+		t.Errorf("dedupe = %v, want [a b]", got)
+	}
+}
 
 // canManageService is the core delegation rule: admins manage everything; a delegated
 // manager manages only its own service; privleg's own meta-rights are admin-only.

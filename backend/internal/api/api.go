@@ -13,6 +13,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"regexp"
@@ -23,6 +24,7 @@ import (
 	"privleg/internal/auth"
 	"privleg/internal/catalog"
 	"privleg/internal/invites"
+	"privleg/internal/rights"
 	"privleg/internal/store"
 	"privleg/internal/users"
 )
@@ -42,18 +44,23 @@ const (
 var (
 	userRe     = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
 	inviteIDRe = regexp.MustCompile(`^[0-9a-f]{8}$`) // holistic-invites.py ids are token_hex(4)
+	groupIDRe  = regexp.MustCompile(`^gen-[0-9a-f]{8}$`)
 )
 
-// Server wires the verifier, catalog and user lister into HTTP handlers.
+const labelMax = 64 // cap a rights-group label before it reaches the store
+
+// Server wires the verifier, catalog, user lister and rights config store into HTTP handlers.
 type Server struct {
 	v   *auth.Verifier
 	cat *catalog.Catalog
 	ul  *users.Lister
+	rs  *rights.Store
+	mat *rights.Materializer
 }
 
 // New builds a server.
-func New(v *auth.Verifier, cat *catalog.Catalog, ul *users.Lister) *Server {
-	return &Server{v: v, cat: cat, ul: ul}
+func New(v *auth.Verifier, cat *catalog.Catalog, ul *users.Lister, rs *rights.Store, mat *rights.Materializer) *Server {
+	return &Server{v: v, cat: cat, ul: ul, rs: rs, mat: mat}
 }
 
 type handler func(w http.ResponseWriter, r *http.Request, u *auth.User)
@@ -66,6 +73,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+base+"users/{username}/grants", s.guard(s.isManager, false, s.getGrants))
 	mux.HandleFunc("PUT "+base+"users/{username}/grants", s.guard(s.isManager, true, s.putGrants))
 	mux.HandleFunc("PUT "+base+"users/{username}/admin", s.guard(isAdmin, true, s.setAdmin))
+	// Rights groups: reading is for any console manager (the editor shows assignments);
+	// defining/assigning groups is admin-only (a group can bundle cross-service rights).
+	mux.HandleFunc("GET "+base+"groups", s.guard(s.isManager, false, s.listGroups))
+	mux.HandleFunc("POST "+base+"groups", s.guard(isAdmin, true, s.createGroup))
+	mux.HandleFunc("PUT "+base+"groups/{id}", s.guard(isAdmin, true, s.updateGroup))
+	mux.HandleFunc("DELETE "+base+"groups/{id}", s.guard(isAdmin, true, s.deleteGroup))
 	mux.HandleFunc("GET "+base+"invites", s.guard(s.canInvite, false, s.listInvites))
 	mux.HandleFunc("POST "+base+"invites", s.guard(s.canInvite, true, s.createInvite))
 	mux.HandleFunc("POST "+base+"invites/{id}/revoke", s.guard(s.canInvite, true, s.revokeInvite))
@@ -171,6 +184,53 @@ func (s *Server) getCatalog(w http.ResponseWriter, _ *http.Request, _ *auth.User
 	writeJSON(w, http.StatusOK, map[string]any{"services": s.cat.Manifests()})
 }
 
+// grantsResp is the per-user rights view. `groups` are the assigned rights-group ids;
+// `overrides` are the per-right manual deviations (on/off); `inherited` are the rights the
+// assigned groups grant (ignoring overrides) — the UI uses it to label the "Gruppe" segment;
+// `effective` is the fully resolved set actually enforced.
+type grantsResp struct {
+	Username    string            `json:"username"`
+	DisplayName string            `json:"displayName"`
+	IsAdmin     bool              `json:"isAdmin"`
+	Groups      []string          `json:"groups"`
+	Overrides   map[string]string `json:"overrides"`
+	Inherited   []string          `json:"inherited"`
+	Effective   []string          `json:"effective"`
+}
+
+// materializableSet is the set of right keys that currently can be synced down (every
+// declared backing-group right + shell right).
+func (s *Server) materializableSet() map[string]bool {
+	set := map[string]bool{}
+	for _, r := range s.cat.Rights() {
+		set[r.Key] = true
+	}
+	return set
+}
+
+// grantsFor builds the per-user rights view from the (possibly synthetic) baseline config.
+func (s *Server) grantsFor(name string) grantsResp {
+	u := s.ul.Resolve(name)
+	cfg := s.mat.BaselineConfig(name)
+	set := s.materializableSet()
+	groups := s.rs.ListGroups()
+	if cfg.Groups == nil {
+		cfg.Groups = []string{}
+	}
+	if cfg.Overrides == nil {
+		cfg.Overrides = map[string]string{}
+	}
+	return grantsResp{
+		Username:    u.Username,
+		DisplayName: u.DisplayName,
+		IsAdmin:     u.IsAdmin,
+		Groups:      cfg.Groups,
+		Overrides:   cfg.Overrides,
+		Inherited:   trueKeys(rights.InheritedRights(cfg, groups, set)),
+		Effective:   trueKeys(rights.Effective(cfg, groups, set)),
+	}
+}
+
 func (s *Server) getGrants(w http.ResponseWriter, r *http.Request, _ *auth.User) {
 	name := r.PathValue("username")
 	if !userRe.MatchString(name) {
@@ -181,9 +241,18 @@ func (s *Server) getGrants(w http.ResponseWriter, r *http.Request, _ *auth.User)
 		writeErr(w, http.StatusNotFound, "Unknown user")
 		return
 	}
-	writeJSON(w, http.StatusOK, s.outFor(name))
+	writeJSON(w, http.StatusOK, s.grantsFor(name))
 }
 
+// putGrants sets a user's rights configuration: the submitted body is the COMPLETE desired
+// {groups, overrides}. We diff it against the user's current baseline (stored config, or a
+// synthetic snapshot of their live rights for a not-yet-migrated user) and authorize each
+// kind of change before applying ANY (no partial escalation):
+//   - any change to group ASSIGNMENT is admin-only (a group can bundle cross-service rights);
+//   - each changed per-right OVERRIDE needs the same per-service right as before
+//     (canManageService) — a delegated manager keeps fine control of its own service.
+//
+// The desired config is then persisted and materialized down to live Linux state.
 func (s *Server) putGrants(w http.ResponseWriter, r *http.Request, caller *auth.User) {
 	name := r.PathValue("username")
 	if !userRe.MatchString(name) {
@@ -194,99 +263,86 @@ func (s *Server) putGrants(w http.ResponseWriter, r *http.Request, caller *auth.
 		writeErr(w, http.StatusNotFound, "Unknown user")
 		return
 	}
+	// Refuse to write a rights config for an admin target. Admins hold everything implicitly
+	// and are never materialized, so editing their config is meaningless — and allowing it
+	// would let a manager pre-stage overrides on an admin that lie dormant (empty baseline)
+	// and then silently materialize if the account is later de-admined. The UI never opens
+	// the editor for admins; this is the matching server-side guard.
+	if s.ul.Resolve(name).IsAdmin {
+		writeErr(w, http.StatusBadRequest, "Cannot edit the rights of an admin")
+		return
+	}
 	var body struct {
-		Rights []string `json:"rights"`
+		Groups    []string          `json:"groups"`
+		Overrides map[string]string `json:"overrides"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
+	if body.Overrides == nil {
+		body.Overrides = map[string]string{}
+	}
+	if body.Groups == nil {
+		body.Groups = []string{}
+	}
 
-	declared := s.cat.DeclaredSet()
-	shellSet := s.cat.ShellPermSet()
-
-	// Classify the desired set: every requested right is a declared group OR a declared
-	// shell-permission key (svc:cat:id). The shell perm has no group — it maps to the
-	// user's login shell (single source of truth), toggled via store.SetShell.
-	desiredGroups := map[string]bool{}
-	desiredShell := false
-	shellKey := ""
-	for _, g := range body.Rights {
-		switch {
-		case declared[g]:
-			desiredGroups[g] = true
-		case shellSet[g]:
-			desiredShell = true
-			shellKey = g
-		default:
-			writeErr(w, http.StatusBadRequest, "Unknown right: "+g)
+	// Validate the desired override keys (declared) and values (on/off).
+	set := s.materializableSet()
+	for key, val := range body.Overrides {
+		if !set[key] {
+			writeErr(w, http.StatusBadRequest, "Unknown right: "+key)
+			return
+		}
+		if val != "on" && val != "off" {
+			writeErr(w, http.StatusBadRequest, "Override must be on or off")
+			return
+		}
+	}
+	// Validate the desired group ids exist.
+	groupSet := map[string]bool{}
+	for _, g := range s.rs.ListGroups() {
+		groupSet[g.ID] = true
+	}
+	for _, gid := range body.Groups {
+		if !groupSet[gid] {
+			writeErr(w, http.StatusBadRequest, "Unknown group: "+gid)
 			return
 		}
 	}
 
-	current := map[string]bool{}
-	for _, g := range filterDeclared(s.ul.Resolve(name).Groups, declared) {
-		current[g] = true
-	}
-	shellOn := users.ShellEnabled(name)
+	before := s.mat.BaselineConfig(name)
+	after := rights.UserConfig{Groups: dedupe(body.Groups), Overrides: body.Overrides}
 
-	// Diff group memberships into add/remove changes.
-	type change struct {
-		group string
-		on    bool
+	// Authorize the group-assignment delta (admin only).
+	if !sameSet(before.Groups, after.Groups) && !caller.IsAdmin {
+		writeErr(w, http.StatusForbidden, "Only admins may change group membership")
+		return
 	}
-	var changes []change
-	for g := range desiredGroups {
-		if !current[g] {
-			changes = append(changes, change{g, true})
-		}
-	}
-	for g := range current {
-		if !desiredGroups[g] {
-			changes = append(changes, change{g, false})
-		}
-	}
-	shellChanged := desiredShell != shellOn
-
-	// Authorize EVERY change before applying ANY (no partial escalation).
-	for _, ch := range changes {
-		svc, _ := s.cat.ServiceOf(ch.group)
-		if !s.canManageService(caller, svc) {
-			writeErr(w, http.StatusForbidden, "You are not allowed to manage "+svc+" rights")
+	// Authorize each changed override by its service.
+	for key := range changedOverrides(before.Overrides, after.Overrides) {
+		svc, _, ok := s.cat.KeyService(key)
+		if !ok {
+			writeErr(w, http.StatusBadRequest, "Unknown right: "+key)
 			return
 		}
-	}
-	if shellChanged {
-		key := shellKey
-		if key == "" { // turning the shell OFF: no desired key, use any declared one
-			for k := range shellSet {
-				key = k
-				break
-			}
-		}
-		svc, _ := s.cat.ShellServiceOf(key)
 		if !s.canManageService(caller, svc) {
 			writeErr(w, http.StatusForbidden, "You are not allowed to manage "+svc+" rights")
 			return
 		}
 	}
 
-	// Apply: group changes first, then the shell change.
-	for _, ch := range changes {
-		if err := store.SetGrant(name, ch.group, ch.on); err != nil {
-			log.Printf("privleg: set grant %s %s=%v failed: %v", name, ch.group, ch.on, err)
-			writeErr(w, http.StatusInternalServerError, "Failed to apply rights change")
-			return
-		}
+	if err := s.rs.SetUser(name, after); err != nil {
+		log.Printf("privleg: persist grants %s failed: %v", name, err)
+		writeErr(w, http.StatusInternalServerError, "Failed to save rights")
+		return
 	}
-	if shellChanged {
-		if err := store.SetShell(name, desiredShell); err != nil {
-			log.Printf("privleg: set shell %s=%v failed: %v", name, desiredShell, err)
-			writeErr(w, http.StatusInternalServerError, "Failed to apply shell change")
-			return
-		}
+	if err := s.mat.Materialize(name); err != nil {
+		log.Printf("privleg: materialize %s failed: %v", name, err)
+		writeErr(w, http.StatusInternalServerError, "Failed to apply rights change")
+		return
 	}
-	writeJSON(w, http.StatusOK, s.outFor(name))
+	writeJSON(w, http.StatusOK, s.grantsFor(name))
 }
 
 func (s *Server) setAdmin(w http.ResponseWriter, r *http.Request, caller *auth.User) {
@@ -314,6 +370,12 @@ func (s *Server) setAdmin(w http.ResponseWriter, r *http.Request, caller *auth.U
 		log.Printf("privleg: set admin %s=%v failed: %v", name, body.Admin, err)
 		writeErr(w, http.StatusInternalServerError, "Failed to change admin status")
 		return
+	}
+	// Reconcile rights to the user's stored config now that their admin status changed.
+	// Promotion is a no-op (admins are never materialized); demotion makes the user's own
+	// stored config take effect immediately rather than waiting for their next edit.
+	if err := s.mat.Materialize(name); err != nil {
+		log.Printf("privleg: re-materialize %s after admin change: %v", name, err)
 	}
 	writeJSON(w, http.StatusOK, s.outFor(name))
 }
@@ -395,7 +457,202 @@ func sanitizeNote(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// --- rights groups -------------------------------------------------------
+// Admin-defined bundles of declared rights. Defining/changing them is admin-only; a change
+// to a group's rights re-materializes every user assigned to it.
+
+type groupOut struct {
+	ID     string   `json:"id"`
+	Label  string   `json:"label"`
+	Rights []string `json:"rights"`
+}
+
+func (s *Server) listGroups(w http.ResponseWriter, _ *http.Request, _ *auth.User) {
+	gs := s.rs.ListGroups()
+	out := make([]groupOut, 0, len(gs))
+	for _, g := range gs {
+		out = append(out, groupOut{g.ID, g.Label, g.Rights})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"groups": out})
+}
+
+// validateGroupBody parses + validates the shared create/update body: a non-empty label and
+// rights keys that are all currently declared (deduped, sorted).
+func (s *Server) validateGroupBody(w http.ResponseWriter, r *http.Request) (string, []string, bool) {
+	var body struct {
+		Label  string   `json:"label"`
+		Rights []string `json:"rights"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "Invalid request body")
+		return "", nil, false
+	}
+	label := sanitizeLabel(body.Label)
+	if label == "" {
+		writeErr(w, http.StatusBadRequest, "A group name is required")
+		return "", nil, false
+	}
+	set := s.materializableSet()
+	seen := map[string]bool{}
+	keys := []string{}
+	for _, k := range body.Rights {
+		if !set[k] {
+			writeErr(w, http.StatusBadRequest, "Unknown right: "+k)
+			return "", nil, false
+		}
+		if !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return label, keys, true
+}
+
+func (s *Server) createGroup(w http.ResponseWriter, r *http.Request, _ *auth.User) {
+	label, keys, ok := s.validateGroupBody(w, r)
+	if !ok {
+		return
+	}
+	g, err := s.rs.CreateGroup(label, keys)
+	if err != nil {
+		log.Printf("privleg: create group failed: %v", err)
+		writeErr(w, http.StatusInternalServerError, "Failed to create the group")
+		return
+	}
+	writeJSON(w, http.StatusOK, groupOut{g.ID, g.Label, g.Rights})
+}
+
+func (s *Server) updateGroup(w http.ResponseWriter, r *http.Request, _ *auth.User) {
+	id := r.PathValue("id")
+	if !groupIDRe.MatchString(id) {
+		writeErr(w, http.StatusBadRequest, "Invalid group id")
+		return
+	}
+	label, keys, ok := s.validateGroupBody(w, r)
+	if !ok {
+		return
+	}
+	g, affected, err := s.rs.UpdateGroup(id, label, keys)
+	if errors.Is(err, rights.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "Unknown group")
+		return
+	} else if err != nil {
+		log.Printf("privleg: update group %s failed: %v", id, err)
+		writeErr(w, http.StatusInternalServerError, "Failed to update the group")
+		return
+	}
+	// Re-sync everyone in the group; best-effort (a per-user failure is logged, not fatal —
+	// the saved definition is the source of truth and the next edit reconciles).
+	if err := s.mat.MaterializeAll(affected); err != nil {
+		log.Printf("privleg: re-materialize after group %s update: %v", id, err)
+	}
+	writeJSON(w, http.StatusOK, groupOut{g.ID, g.Label, g.Rights})
+}
+
+func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request, _ *auth.User) {
+	id := r.PathValue("id")
+	if !groupIDRe.MatchString(id) {
+		writeErr(w, http.StatusBadRequest, "Invalid group id")
+		return
+	}
+	affected, err := s.rs.DeleteGroup(id)
+	if errors.Is(err, rights.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "Unknown group")
+		return
+	} else if err != nil {
+		log.Printf("privleg: delete group %s failed: %v", id, err)
+		writeErr(w, http.StatusInternalServerError, "Failed to delete the group")
+		return
+	}
+	if err := s.mat.MaterializeAll(affected); err != nil {
+		log.Printf("privleg: re-materialize after group %s delete: %v", id, err)
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 // --- helpers -------------------------------------------------------------
+
+// trueKeys returns the sorted keys of a set that map to true.
+func trueKeys(m map[string]bool) []string {
+	out := []string{}
+	for k, v := range m {
+		if v {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// dedupe returns xs with duplicates removed, order-independent (sorted).
+func dedupe(xs []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, x := range xs {
+		if !seen[x] {
+			seen[x] = true
+			out = append(out, x)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// sameSet reports whether two string slices contain the same elements (ignoring order/dupes).
+func sameSet(a, b []string) bool {
+	am, bm := map[string]bool{}, map[string]bool{}
+	for _, x := range a {
+		am[x] = true
+	}
+	for _, x := range b {
+		bm[x] = true
+	}
+	if len(am) != len(bm) {
+		return false
+	}
+	for k := range am {
+		if !bm[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// changedOverrides returns the set of right keys whose override value differs between before
+// and after (added, removed, or flipped).
+func changedOverrides(before, after map[string]string) map[string]bool {
+	out := map[string]bool{}
+	for k, v := range before {
+		if after[k] != v {
+			out[k] = true
+		}
+	}
+	for k, v := range after {
+		if before[k] != v {
+			out[k] = true
+		}
+	}
+	return out
+}
+
+// sanitizeLabel strips control characters, collapses surrounding whitespace and caps length.
+func sanitizeLabel(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return ' '
+		}
+		if r < 0x20 {
+			return -1
+		}
+		return r
+	}, s)
+	s = strings.TrimSpace(s)
+	if len(s) > labelMax {
+		s = strings.TrimSpace(s[:labelMax])
+	}
+	return s
+}
 
 func filterDeclared(groups []string, declared map[string]bool) []string {
 	out := []string{}
