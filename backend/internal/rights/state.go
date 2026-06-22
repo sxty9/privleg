@@ -48,6 +48,9 @@ type UserConfig struct {
 type State struct {
 	Groups []Group               `json:"groups"`
 	Users  map[string]UserConfig `json:"users"`
+	// InviteConfigs holds the rights config an admin attached to an invite, keyed by invite
+	// id. The reconciler copies it onto whoever consumes the invite, then drops it.
+	InviteConfigs map[string]UserConfig `json:"inviteConfigs,omitempty"`
 }
 
 // Store is the atomic, in-memory-cached persistence for State. privlegd is the only writer.
@@ -237,6 +240,65 @@ func (s *Store) DeleteUser(name string) error {
 		return err
 	}
 	return nil
+}
+
+// SetInviteConfig stores the rights config attached to an invite (keyed by invite id).
+func (s *Store) SetInviteConfig(inviteID string, cfg UserConfig) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.st.InviteConfigs == nil {
+		s.st.InviteConfigs = map[string]UserConfig{}
+	}
+	prev, had := s.st.InviteConfigs[inviteID]
+	s.st.InviteConfigs[inviteID] = cloneConfig(cfg)
+	if err := s.save(); err != nil {
+		if had {
+			s.st.InviteConfigs[inviteID] = prev
+		} else {
+			delete(s.st.InviteConfigs, inviteID)
+		}
+		return err
+	}
+	return nil
+}
+
+// InviteConfig returns the config attached to an invite (deep copy) and whether one exists.
+func (s *Store) InviteConfig(inviteID string) (UserConfig, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg, ok := s.st.InviteConfigs[inviteID]
+	if !ok {
+		return UserConfig{}, false
+	}
+	return cloneConfig(cfg), true
+}
+
+// DeleteInviteConfig drops an invite's config (after it's been applied, or on revoke). No-op
+// if absent.
+func (s *Store) DeleteInviteConfig(inviteID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev, ok := s.st.InviteConfigs[inviteID]
+	if !ok {
+		return nil
+	}
+	delete(s.st.InviteConfigs, inviteID)
+	if err := s.save(); err != nil {
+		s.st.InviteConfigs[inviteID] = prev
+		return err
+	}
+	return nil
+}
+
+// InviteConfigIDs returns the invite ids that currently carry a config (snapshot).
+func (s *Store) InviteConfigIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.st.InviteConfigs))
+	for id := range s.st.InviteConfigs {
+		out = append(out, id)
+	}
+	return out
 }
 
 // membersOf returns the usernames assigned to a group id. Caller must hold s.mu.

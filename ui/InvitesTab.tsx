@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Badge,
   Button,
+  Checkbox,
   CodeBlock,
   DataTable,
   EmptyState,
@@ -15,9 +16,12 @@ import {
   useLiveQuery,
   useT,
   type Column,
+  type PermissionManifest,
   type ServiceContextProps,
 } from '@holistic/ui';
-import type { CreatedInvite, Invite, InvitesResponse, InviteState } from './types';
+import { RightsConfigEditor, type RightsConfigValue } from './RightsConfigEditor';
+import { rightKey } from './RightsCatalog';
+import type { CatalogResponse, CreatedInvite, GroupsResponse, Invite, InvitesResponse, InviteState } from './types';
 
 const STATE_KEY: Record<InviteState, string> = {
   active: 'privleg.stateActive',
@@ -37,26 +41,71 @@ function fmtDate(secs: number | null): string {
   return new Date(secs * 1000).toLocaleDateString();
 }
 
-// Full invite management for admins + holders of hp_priv_invite: mint a code, list all
-// codes (incl. who redeemed them), and revoke active ones. The daemon enforces the same gate.
-export function InvitesTab({ api, ui }: ServiceContextProps) {
+// Pre-seed an invite's rights config with the current default-on rights set to "on", so the
+// template starts as a "default user" (parity with how an existing user's defaults show) and
+// the admin adjusts from there. Mirrors the catalog's `default` flag.
+function defaultSeed(services: PermissionManifest[]): Record<string, 'on'> {
+  const seed: Record<string, 'on'> = {};
+  for (const svc of services) {
+    for (const c of svc.categories) {
+      for (const p of c.permissions) {
+        if (p.default) seed[rightKey(svc.service, c.id, p)] = 'on';
+      }
+    }
+  }
+  return seed;
+}
+
+// Full invite management for admins + holders of hp_priv_invite: mint a code, list all codes
+// (incl. who redeemed them), and revoke active ones. Admins can additionally attach a rights
+// configuration that whoever registers with the code receives automatically. The daemon
+// enforces the same gates.
+export function InvitesTab({ api, ui, user }: ServiceContextProps) {
   const t = useT();
   const { data, loading, refresh } = useLiveQuery<InvitesResponse>(() => api.get<InvitesResponse>('invites'), 5000);
+  const cat = useLiveQuery<CatalogResponse>(() => api.get<CatalogResponse>('catalog'), 30000);
+  const grps = useLiveQuery<GroupsResponse>(() => api.get<GroupsResponse>('groups'), 30000);
   const invites = data?.invites ?? [];
+  const services = cat.data?.services ?? [];
+  const groups = grps.data?.groups ?? [];
 
   const [note, setNote] = useState('');
   const [days, setDays] = useState('');
   const [busy, setBusy] = useState(false);
   const [created, setCreated] = useState<string | null>(null);
+  const [cfgEnabled, setCfgEnabled] = useState(false);
+  const [cfg, setCfg] = useState<RightsConfigValue>({ groups: [], overrides: {} });
+
+  // Seed the config with the current default-on rights the first time the section is enabled —
+  // and retry once the catalog has loaded, so opening it before the catalog arrives still
+  // pre-fills (parity with how an existing user's defaults show). Never clobbers edits.
+  const seeded = useRef(false);
+  useEffect(() => {
+    if (!cfgEnabled) {
+      seeded.current = false;
+      return;
+    }
+    if (!seeded.current && services.length > 0) {
+      seeded.current = true;
+      setCfg((c) => (c.groups.length === 0 && Object.keys(c.overrides).length === 0 ? { groups: [], overrides: defaultSeed(services) } : c));
+    }
+  }, [cfgEnabled, services]);
 
   async function create() {
     setBusy(true);
     try {
       const expiresDays = days.trim() === '' ? 0 : Math.max(0, Math.min(3650, parseInt(days, 10) || 0));
-      const res = await api.post<CreatedInvite>('invites', { note: note.trim(), expiresDays });
+      const payload: Record<string, unknown> = { note: note.trim(), expiresDays };
+      if (cfgEnabled) {
+        payload.groups = cfg.groups;
+        payload.overrides = cfg.overrides;
+      }
+      const res = await api.post<CreatedInvite>('invites', payload);
       setCreated(res.code);
       setNote('');
       setDays('');
+      setCfgEnabled(false);
+      setCfg({ groups: [], overrides: {} });
       refresh();
     } catch (e) {
       ui.toast({ title: t('privleg.createCodeError'), description: (e as Error).message, variant: 'error' });
@@ -91,7 +140,10 @@ export function InvitesTab({ api, ui }: ServiceContextProps) {
       hideable: false,
       render: (i) => (
         <Stack gap={0}>
-          <Text weight="semibold">{i.note || t('privleg.noNote')}</Text>
+          <Stack direction="row" align="center" gap={2}>
+            <Text weight="semibold">{i.note || t('privleg.noNote')}</Text>
+            {i.hasRights && <Badge variant="accent">{t('privleg.badgeHasRights')}</Badge>}
+          </Stack>
           <Text variant="footnote" color="secondary">
             {i.id}
           </Text>
@@ -158,21 +210,39 @@ export function InvitesTab({ api, ui }: ServiceContextProps) {
           </Text>
           <Stack direction="row" gap={3} align="end" wrap>
             <Field label={t('privleg.fieldNote')} hint={t('privleg.fieldNoteHint')} className="flex-1 min-w-[200px]">
-              <Input
-                value={note}
-                onChange={(e) => setNote(e.target.value)}
-                placeholder={t('privleg.notePlaceholder')}
-                maxLength={200}
-              />
+              <Input value={note} onChange={(e) => setNote(e.target.value)} placeholder={t('privleg.notePlaceholder')} maxLength={200} />
             </Field>
             <Field label={t('privleg.fieldValidDays')} hint={t('privleg.fieldValidHint')} className="w-[160px]">
-              <Input
-                value={days}
-                onChange={(e) => setDays(e.target.value.replace(/[^0-9]/g, ''))}
-                placeholder="0"
-                inputMode="numeric"
-              />
+              <Input value={days} onChange={(e) => setDays(e.target.value.replace(/[^0-9]/g, ''))} placeholder="0" inputMode="numeric" />
             </Field>
+          </Stack>
+
+          {/* Admin-only: attach a rights config that whoever registers with this code receives. */}
+          {user.isAdmin && (
+            <Stack gap={3}>
+              <Checkbox checked={cfgEnabled} onChange={setCfgEnabled} label={t('privleg.inviteRightsToggle')} />
+              {cfgEnabled && (
+                <Stack gap={3}>
+                  <Text variant="footnote" color="secondary">
+                    {t('privleg.inviteRightsHint')}
+                  </Text>
+                  <RightsConfigEditor
+                    services={services}
+                    groups={groups}
+                    value={cfg}
+                    onChange={setCfg}
+                    canManage={() => true}
+                    assignmentEditable
+                    confirmDanger={(label) =>
+                      ui.confirm({ title: t('privleg.grantTitle', { label }), description: t('privleg.grantDesc'), confirmLabel: t('privleg.grant') })
+                    }
+                  />
+                </Stack>
+              )}
+            </Stack>
+          )}
+
+          <Stack direction="row" justify="end">
             <Button variant="primary" loading={busy} onClick={create}>
               {t('privleg.createCode')}
             </Button>

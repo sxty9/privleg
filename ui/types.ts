@@ -60,6 +60,7 @@ export interface Invite {
   usedBy: string; // "" until consumed
   usedAt: number | null;
   state: InviteState;
+  hasRights: boolean; // an admin attached a (still-pending) rights config to this invite
 }
 
 export interface InvitesResponse {

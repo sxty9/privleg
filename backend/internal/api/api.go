@@ -209,6 +209,32 @@ func (s *Server) materializableSet() map[string]bool {
 	return set
 }
 
+// validateConfig checks a {groups, overrides} rights config: every override key must be a
+// currently-declared right with an "on"/"off" value, and every group id must exist. Returns
+// a client-facing message and false on the first problem. Shared by putGrants and the invite
+// config path.
+func (s *Server) validateConfig(groups []string, overrides map[string]string) (string, bool) {
+	set := s.materializableSet()
+	for key, val := range overrides {
+		if !set[key] {
+			return "Unknown right: " + key, false
+		}
+		if val != "on" && val != "off" {
+			return "Override must be on or off", false
+		}
+	}
+	groupSet := map[string]bool{}
+	for _, g := range s.rs.ListGroups() {
+		groupSet[g.ID] = true
+	}
+	for _, gid := range groups {
+		if !groupSet[gid] {
+			return "Unknown group: " + gid, false
+		}
+	}
+	return "", true
+}
+
 // grantsFor builds the per-user rights view from the (possibly synthetic) baseline config.
 func (s *Server) grantsFor(name string) grantsResp {
 	u := s.ul.Resolve(name)
@@ -288,28 +314,9 @@ func (s *Server) putGrants(w http.ResponseWriter, r *http.Request, caller *auth.
 		body.Groups = []string{}
 	}
 
-	// Validate the desired override keys (declared) and values (on/off).
-	set := s.materializableSet()
-	for key, val := range body.Overrides {
-		if !set[key] {
-			writeErr(w, http.StatusBadRequest, "Unknown right: "+key)
-			return
-		}
-		if val != "on" && val != "off" {
-			writeErr(w, http.StatusBadRequest, "Override must be on or off")
-			return
-		}
-	}
-	// Validate the desired group ids exist.
-	groupSet := map[string]bool{}
-	for _, g := range s.rs.ListGroups() {
-		groupSet[g.ID] = true
-	}
-	for _, gid := range body.Groups {
-		if !groupSet[gid] {
-			writeErr(w, http.StatusBadRequest, "Unknown group: "+gid)
-			return
-		}
+	if msg, ok := s.validateConfig(body.Groups, body.Overrides); !ok {
+		writeErr(w, http.StatusBadRequest, msg)
+		return
 	}
 
 	before := s.mat.BaselineConfig(name)
@@ -440,6 +447,13 @@ func (s *Server) refresh(w http.ResponseWriter, _ *http.Request, _ *auth.User) {
 // canInvite gates the invite endpoints: admins, or a non-admin holding hp_priv_invite.
 func (s *Server) canInvite(u *auth.User) bool { return u.Can(inviteGroup) }
 
+// inviteOut is the API view of an invite plus whether it still carries a pending rights
+// config (dropped once consumed/revoked), so the UI can badge invites that auto-grant rights.
+type inviteOut struct {
+	invites.Invite
+	HasRights bool `json:"hasRights"`
+}
+
 func (s *Server) listInvites(w http.ResponseWriter, _ *http.Request, _ *auth.User) {
 	list, err := invites.List(time.Now().Unix())
 	if err != nil {
@@ -447,13 +461,20 @@ func (s *Server) listInvites(w http.ResponseWriter, _ *http.Request, _ *auth.Use
 		writeErr(w, http.StatusInternalServerError, "Could not read invites")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"invites": list})
+	out := make([]inviteOut, 0, len(list))
+	for _, inv := range list {
+		_, has := s.rs.InviteConfig(inv.ID)
+		out = append(out, inviteOut{Invite: inv, HasRights: has})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"invites": out})
 }
 
-func (s *Server) createInvite(w http.ResponseWriter, r *http.Request, _ *auth.User) {
+func (s *Server) createInvite(w http.ResponseWriter, r *http.Request, caller *auth.User) {
 	var body struct {
-		Note        string `json:"note"`
-		ExpiresDays int    `json:"expiresDays"`
+		Note        string            `json:"note"`
+		ExpiresDays int               `json:"expiresDays"`
+		Groups      []string          `json:"groups"`
+		Overrides   map[string]string `json:"overrides"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "Invalid request body")
@@ -463,11 +484,50 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request, _ *auth.Us
 		writeErr(w, http.StatusBadRequest, "expiresDays must be between 0 and 3650")
 		return
 	}
+	// A rights config attached to the invite (auto-applied to whoever registers with it) is
+	// admin-only — it can grant cross-service rights, exactly like group assignment. Non-admin
+	// invite managers may still mint plain invites.
+	hasConfig := len(body.Groups) > 0 || len(body.Overrides) > 0
+	if hasConfig {
+		if !caller.IsAdmin {
+			writeErr(w, http.StatusForbidden, "Only admins may attach a rights configuration to an invite")
+			return
+		}
+		if msg, ok := s.validateConfig(body.Groups, body.Overrides); !ok {
+			writeErr(w, http.StatusBadRequest, msg)
+			return
+		}
+	}
 	code, err := invites.New(body.ExpiresDays, sanitizeNote(body.Note))
 	if err != nil {
 		log.Printf("privleg: create invite failed: %v", err)
 		writeErr(w, http.StatusInternalServerError, "Could not create the invite")
 		return
+	}
+	if code == "" {
+		log.Printf("privleg: create invite returned an empty code")
+		writeErr(w, http.StatusInternalServerError, "Could not create the invite")
+		return
+	}
+	if hasConfig {
+		// The invite is already minted; key its config by the new invite's id (found via the
+		// code's hash). If keying fails, the invite would be live WITHOUT its rights config — so
+		// fail loudly (revoking it where we can) rather than hand back a code that silently
+		// grants nothing.
+		id, err := invites.IDForCode(code)
+		if err != nil {
+			log.Printf("privleg: could not key invite config (code already minted): %v", err)
+			writeErr(w, http.StatusInternalServerError, "The invite was created but its rights config could not be attached. Please revoke it and try again.")
+			return
+		}
+		if err := s.rs.SetInviteConfig(id, rights.UserConfig{Groups: dedupe(body.Groups), Overrides: body.Overrides}); err != nil {
+			log.Printf("privleg: store invite config for %s failed: %v", id, err)
+			if rerr := invites.Revoke(id); rerr != nil {
+				log.Printf("privleg: revoke after failed config store %s: %v", id, rerr)
+			}
+			writeErr(w, http.StatusInternalServerError, "Could not attach the rights configuration to the invite.")
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"code": code})
 }
@@ -482,6 +542,10 @@ func (s *Server) revokeInvite(w http.ResponseWriter, r *http.Request, _ *auth.Us
 		log.Printf("privleg: revoke invite %s failed: %v", id, err)
 		writeErr(w, http.StatusInternalServerError, "Could not revoke the invite")
 		return
+	}
+	// A revoked invite will never be consumed, so drop any rights config it carried.
+	if err := s.rs.DeleteInviteConfig(id); err != nil {
+		log.Printf("privleg: drop invite config for revoked %s: %v", id, err)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

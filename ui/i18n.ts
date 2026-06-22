@@ -111,6 +111,9 @@ registerMessages({
     'privleg.createdModalTitle': 'Invite code created',
     'privleg.createdModalDesc': 'Share this code with the person. It’s shown only now — afterwards it can’t be viewed again.',
     'privleg.done': 'Done',
+    'privleg.inviteRightsToggle': 'Pre-configure rights for this invite',
+    'privleg.inviteRightsHint': 'Whoever registers with this code automatically receives these rights. Defaults are pre-filled — adjust as needed.',
+    'privleg.badgeHasRights': '+ rights',
 
     // Rights catalog — localized labels for the aggregated permissions.d manifests
     // (keyed by service / category / permission id; fall back to the manifest text).
@@ -260,6 +263,9 @@ registerMessages({
     'privleg.createdModalTitle': 'Einladungscode erstellt',
     'privleg.createdModalDesc': 'Gib diesen Code an die Person weiter. Er wird nur jetzt angezeigt — danach lässt er sich nicht mehr einsehen.',
     'privleg.done': 'Fertig',
+    'privleg.inviteRightsToggle': 'Rechte für diesen Invite vorkonfigurieren',
+    'privleg.inviteRightsHint': 'Wer sich mit diesem Code registriert, erhält diese Rechte automatisch. Standard-Rechte sind vorausgefüllt — passe sie nach Bedarf an.',
+    'privleg.badgeHasRights': '+ Rechte',
 
     'service.remshel': 'Remote Shell',
     'rights.cat.samba.shares': 'Dateifreigaben',
@@ -407,6 +413,9 @@ registerMessages({
     'privleg.createdModalTitle': '招待コードを作成しました',
     'privleg.createdModalDesc': 'このコードを相手に渡してください。今だけ表示され、その後は再表示できません。',
     'privleg.done': '完了',
+    'privleg.inviteRightsToggle': 'この招待の権限を事前設定する',
+    'privleg.inviteRightsHint': 'このコードで登録した人は、これらの権限を自動的に受け取ります。標準の権限はあらかじめ設定されています — 必要に応じて調整してください。',
+    'privleg.badgeHasRights': '権限付き',
 
     'service.remshel': 'リモートシェル',
     'rights.cat.samba.shares': 'ファイル共有',

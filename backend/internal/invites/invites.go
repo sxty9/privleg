@@ -7,6 +7,8 @@
 package invites
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -42,6 +44,7 @@ type Invite struct {
 // rawInvite mirrors the on-disk shape written by holistic-invites.py.
 type rawInvite struct {
 	ID      string  `json:"id"`
+	Hash    string  `json:"hash"` // sha256(code); lets us map a freshly-minted code back to its id
 	Note    string  `json:"note"`
 	Created int64   `json:"created"`
 	Expires *int64  `json:"expires"`
@@ -109,6 +112,52 @@ func New(expiresDays int, note string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// IDForCode returns the id of the invite whose stored hash matches the plaintext code —
+// used right after minting to key a rights config by the new invite's id (holistic-invites.py
+// stores only the hash, and its `new` prints only the code). Matches _hash in that tool:
+// sha256 of the trimmed code.
+func IDForCode(code string) (string, error) {
+	b, err := os.ReadFile(storePath())
+	if err != nil {
+		return "", err
+	}
+	var s rawStore
+	if err := json.Unmarshal(b, &s); err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(code)))
+	want := hex.EncodeToString(sum[:])
+	for _, r := range s.Invites {
+		if r.Hash == want {
+			return r.ID, nil
+		}
+	}
+	return "", fmt.Errorf("invites: no invite matches the code")
+}
+
+// UsedBy reports the user who consumed an invite (its used_by) and whether the invite exists.
+// A missing/unreadable store yields exists=false (treated as "not yet known", never as a
+// signal to drop anything). Used by the rights reconciler to find who an invite created.
+func UsedBy(id string) (usedBy string, exists bool) {
+	b, err := os.ReadFile(storePath())
+	if err != nil {
+		return "", false
+	}
+	var s rawStore
+	if json.Unmarshal(b, &s) != nil {
+		return "", false
+	}
+	for _, r := range s.Invites {
+		if r.ID == id {
+			if r.UsedBy != nil {
+				return *r.UsedBy, true
+			}
+			return "", true
+		}
+	}
+	return "", false
 }
 
 // Revoke soft-revokes an invite by id via the root wrapper.

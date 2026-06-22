@@ -16,6 +16,7 @@ import (
 type Live interface {
 	Resolve(name string) users.User
 	ShellEnabled(name string) bool
+	IsManaged(name string) bool
 }
 
 // Applier performs the actual privileged mutations. Abstracted so tests can assert the
@@ -29,6 +30,7 @@ type liveOS struct{ ul *users.Lister }
 
 func (l liveOS) Resolve(name string) users.User { return l.ul.Resolve(name) }
 func (l liveOS) ShellEnabled(name string) bool  { return users.ShellEnabled(name) }
+func (l liveOS) IsManaged(name string) bool     { return l.ul.IsManaged(name) }
 
 type storeApplier struct{}
 
@@ -182,6 +184,103 @@ func (m *Materializer) Materialize(name string) error {
 		return fmt.Errorf("materialize %s: %v", name, errs)
 	}
 	return nil
+}
+
+// InviteLookup reports the user who consumed an invite (its used_by, "" if not yet consumed)
+// and whether the invite exists. A read failure should report exists=false so the reconciler
+// leaves the config untouched and retries later — never drops it on a transient error.
+type InviteLookup func(inviteID string) (usedBy string, exists bool)
+
+// ReconcileInvites applies any pending invite rights configs, in two passes per invite so a
+// late grant_defaults can't defeat it. For each stored invite config consumed by a now-existing,
+// managed, non-admin user:
+//   - first pass (user has no config yet): the invite config BECOMES the user's config and is
+//     materialized — but the invite config is KEPT for one more round. The dashboard's
+//     grant_defaults (which sets default-on rights, e.g. the login shell) runs unordered with
+//     respect to this tick, so a single apply could be undone by a later grant_defaults.
+//   - second pass (user's config still equals the invite config): re-materialize — now reliably
+//     after grant_defaults — then drop the invite config.
+//
+// The config is dropped without applying when the consumer is an admin, or when the user's
+// config differs from the invite config (an admin has since edited them — never clobber).
+// Unconsumed / not-yet-created / momentarily-unreadable cases are left for the next run.
+// Idempotent and safe on a timer.
+func (m *Materializer) ReconcileInvites(lookup InviteLookup) error {
+	var errs []string
+	for _, id := range m.store.InviteConfigIDs() {
+		cfg, ok := m.store.InviteConfig(id)
+		if !ok {
+			continue
+		}
+		usedBy, exists := lookup(id)
+		if !exists || usedBy == "" {
+			continue // not consumed yet (or store unreadable) — retry next run
+		}
+		if !m.live.IsManaged(usedBy) {
+			continue // account not created yet — retry next run
+		}
+		if m.live.Resolve(usedBy).IsAdmin {
+			_ = m.store.DeleteInviteConfig(id) // never configure admins
+			continue
+		}
+		existing, has := m.store.GetUser(usedBy)
+		if !has {
+			// First pass: adopt the invite config as the user's config and materialize, but keep
+			// the invite config one more round (see the two-pass note above).
+			if err := m.store.SetUser(usedBy, cfg); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", usedBy, err))
+				continue
+			}
+			if err := m.Materialize(usedBy); err != nil {
+				log.Printf("privleg: materialize invite config for %s: %v", usedBy, err)
+			}
+			continue
+		}
+		if !configEqual(existing, cfg) {
+			_ = m.store.DeleteInviteConfig(id) // admin has edited them — don't re-assert
+			continue
+		}
+		// Second pass: re-assert (now reliably after grant_defaults), then drop.
+		if err := m.Materialize(usedBy); err != nil {
+			log.Printf("privleg: re-materialize invite config for %s: %v", usedBy, err)
+		}
+		_ = m.store.DeleteInviteConfig(id)
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("reconcile invites: %v", errs)
+	}
+	return nil
+}
+
+// configEqual reports whether two configs are the same (groups compared as a set, overrides as
+// a map) — used to tell "the user still has exactly the invite config we applied" from "an
+// admin has since edited them".
+func configEqual(a, b UserConfig) bool {
+	if len(a.Overrides) != len(b.Overrides) {
+		return false
+	}
+	for k, v := range a.Overrides {
+		if b.Overrides[k] != v {
+			return false
+		}
+	}
+	ag := map[string]bool{}
+	for _, g := range a.Groups {
+		ag[g] = true
+	}
+	bg := map[string]bool{}
+	for _, g := range b.Groups {
+		bg[g] = true
+	}
+	if len(ag) != len(bg) {
+		return false
+	}
+	for g := range ag {
+		if !bg[g] {
+			return false
+		}
+	}
+	return true
 }
 
 // MaterializeAll reconciles many users, best-effort: every user is attempted even if some

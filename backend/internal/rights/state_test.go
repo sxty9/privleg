@@ -130,6 +130,32 @@ func TestDeleteUser(t *testing.T) {
 	}
 }
 
+func TestInviteConfigRoundtrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rights.json")
+	s, _ := Open(path)
+	if err := s.SetInviteConfig("inv1", UserConfig{Groups: []string{"g1"}, Overrides: map[string]string{"hp_x": "off"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Persists across reopen.
+	s2, _ := Open(path)
+	cfg, ok := s2.InviteConfig("inv1")
+	if !ok || !contains(cfg.Groups, "g1") || cfg.Overrides["hp_x"] != "off" {
+		t.Errorf("invite config roundtrip failed: %+v ok=%v", cfg, ok)
+	}
+	if ids := s2.InviteConfigIDs(); len(ids) != 1 || ids[0] != "inv1" {
+		t.Errorf("InviteConfigIDs = %v, want [inv1]", ids)
+	}
+	if err := s2.DeleteInviteConfig("inv1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s2.InviteConfig("inv1"); ok {
+		t.Error("invite config should be gone after delete")
+	}
+	if err := s2.DeleteInviteConfig("missing"); err != nil {
+		t.Errorf("deleting a missing invite config must be a no-op: %v", err)
+	}
+}
+
 func reflect_equalStrings(a, b []string) bool {
 	a = append([]string{}, a...)
 	b = append([]string{}, b...)

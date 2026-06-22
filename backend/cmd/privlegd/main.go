@@ -19,6 +19,7 @@ import (
 	"privleg/internal/api"
 	"privleg/internal/auth"
 	"privleg/internal/catalog"
+	"privleg/internal/invites"
 	"privleg/internal/rights"
 	"privleg/internal/users"
 )
@@ -63,6 +64,24 @@ func main() {
 		log.Printf("privlegd listening on %s (rights from %s)", *listen, *permsDir)
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("privlegd: %v", err)
+		}
+	}()
+
+	// Apply pending invite rights configs in the background. The registration flow lives in the
+	// dashboard, so privleg learns of a new account by watching the shared invite store: when an
+	// invite that carried a config is consumed, its config becomes the new user's config and is
+	// materialized. Runs once at startup, then on a short interval.
+	go func() {
+		reconcile := func() {
+			if err := mat.ReconcileInvites(invites.UsedBy); err != nil {
+				log.Printf("privlegd: reconcile invites: %v", err)
+			}
+		}
+		reconcile()
+		t := time.NewTicker(20 * time.Second)
+		defer t.Stop()
+		for range t.C {
+			reconcile()
 		}
 	}()
 
