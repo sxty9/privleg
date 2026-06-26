@@ -5,6 +5,7 @@ import {
   Panel,
   SegmentedControl,
   Stack,
+  Switch,
   Text,
   useT,
   type PermissionManifest,
@@ -62,9 +63,16 @@ export function RightsConfigEditor({ services, groups, value, onChange, canManag
   };
 
   const control = (right: CatalogRight) => {
+    const disabled = !canManage(right.service);
+    // With no group assigned there is nothing to inherit, so the middle "Group" state is
+    // meaningless (always "Group · off"). Fall back to a plain Off/On switch: on = force-on,
+    // off = no override (which, without groups, resolves to off).
+    if (value.groups.length === 0) {
+      const on = value.overrides[right.key] === 'on';
+      return <Switch checked={on} disabled={disabled} onChange={(next) => setTri(right, next ? 'on' : 'group')} />;
+    }
     const v: TriState = value.overrides[right.key] ?? 'group';
     const groupYields = inherited.has(right.key);
-    const disabled = !canManage(right.service);
     const options: SegmentedOption<TriState>[] = [
       { value: 'off', label: t('privleg.triOff') },
       { value: 'group', label: groupYields ? t('privleg.triGroupOn') : t('privleg.triGroupOff') },
