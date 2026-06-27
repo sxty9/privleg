@@ -118,6 +118,12 @@ registerMessages({
     // Rights catalog — localized labels for the aggregated permissions.d manifests
     // (keyed by service / category / permission id; fall back to the manifest text).
     'service.remshel': 'Remote Shell',
+    'rights.cat.samba.files': 'Files',
+    'rights.catdesc.samba.files': 'Access to the file storage.',
+    'rights.perm.samba.files.view': 'View files',
+    'rights.permdesc.samba.files.view': 'Open the Files app and view/download files and folders. Without this right the Files tab is hidden.',
+    'rights.perm.samba.files.edit': 'Edit files',
+    'rights.permdesc.samba.files.edit': 'Create, change, upload, move and delete files in your own space.',
     'rights.cat.samba.shares': 'File shares',
     'rights.catdesc.samba.shares': 'Permissions for the shared Samba spaces.',
     'rights.perm.samba.shares.family-write': 'Write to the Family folder',
@@ -268,6 +274,12 @@ registerMessages({
     'privleg.badgeHasRights': '+ Rechte',
 
     'service.remshel': 'Remote Shell',
+    'rights.cat.samba.files': 'Dateien',
+    'rights.catdesc.samba.files': 'Zugriff auf die Dateiablage.',
+    'rights.perm.samba.files.view': 'Dateien ansehen',
+    'rights.permdesc.samba.files.view': 'Die Dateien-App öffnen und Dateien/Ordner ansehen und herunterladen. Ohne dieses Recht erscheint der Dateien-Tab nicht.',
+    'rights.perm.samba.files.edit': 'Dateien bearbeiten',
+    'rights.permdesc.samba.files.edit': 'Dateien im eigenen Bereich anlegen, ändern, hochladen, verschieben und löschen.',
     'rights.cat.samba.shares': 'Dateifreigaben',
     'rights.catdesc.samba.shares': 'Rechte für die geteilten Samba-Bereiche.',
     'rights.perm.samba.shares.family-write': 'Im Familien-Ordner schreiben',
@@ -418,6 +430,12 @@ registerMessages({
     'privleg.badgeHasRights': '権限付き',
 
     'service.remshel': 'リモートシェル',
+    'rights.cat.samba.files': 'ファイル',
+    'rights.catdesc.samba.files': 'ファイルストレージへのアクセス。',
+    'rights.perm.samba.files.view': 'ファイルを表示',
+    'rights.permdesc.samba.files.view': 'ファイルアプリを開き、ファイル／フォルダを表示・ダウンロードします。この権限がないとファイルタブは表示されません。',
+    'rights.perm.samba.files.edit': 'ファイルを編集',
+    'rights.permdesc.samba.files.edit': '自分の領域でファイルを作成・変更・アップロード・移動・削除します。',
     'rights.cat.samba.shares': 'ファイル共有',
     'rights.catdesc.samba.shares': '共有 Samba 領域の権限。',
     'rights.perm.samba.shares.family-write': '家族フォルダへの書き込み',
