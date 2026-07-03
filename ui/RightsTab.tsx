@@ -69,7 +69,7 @@ export function RightsTab({ api, ui, user, username, onBack }: Props) {
       <RightsConfigEditor
         services={services}
         groups={groups}
-        value={{ groups: target.groups, overrides: target.overrides }}
+        value={{ groups: target.groups, overrides: target.overrides, contactOptOut: target.contactOptOut }}
         onChange={save}
         canManage={target.isAdmin ? () => false : canManage}
         assignmentEditable={user.isAdmin && !target.isAdmin}

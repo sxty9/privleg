@@ -17,11 +17,13 @@ import type { OverrideState, RightsGroup } from './types';
 // The three states of a per-right switch: force-off, inherit-from-groups, force-on.
 type TriState = 'off' | 'group' | 'on';
 
-// A rights configuration: assigned rights-group ids + per-right manual overrides. The exact
-// shape stored per user AND attached to an invite.
+// A rights configuration: assigned rights-group ids + per-right manual overrides + the ids of
+// contact-visibility groups this user is excluded from the contact web of. The exact shape stored
+// per user AND attached to an invite.
 export interface RightsConfigValue {
   groups: string[];
   overrides: Record<string, OverrideState>;
+  contactOptOut: string[];
 }
 
 interface Props {
@@ -44,11 +46,23 @@ interface Props {
 export function RightsConfigEditor({ services, groups, value, onChange, canManage, assignmentEditable, confirmDanger }: Props) {
   const t = useT();
   const assigned = new Set(value.groups);
+  const optedOut = new Set(value.contactOptOut);
   // What the "Group" state yields per right: the union of the assigned groups' rights.
   const inherited = new Set(value.groups.flatMap((gid) => groups.find((g) => g.id === gid)?.rights ?? []));
 
   const toggleGroup = (id: string, on: boolean) => {
-    onChange({ ...value, groups: on ? [...value.groups, id] : value.groups.filter((g) => g !== id) });
+    onChange({
+      ...value,
+      groups: on ? [...value.groups, id] : value.groups.filter((g) => g !== id),
+      // Leaving a group also clears any contact opt-out for it (it no longer applies).
+      contactOptOut: on ? value.contactOptOut : value.contactOptOut.filter((g) => g !== id),
+    });
+  };
+
+  // Contact participation is decoupled from rights (Model B): a member of a contact group can be
+  // excluded from its web without losing the group's rights. `on` = participates (not opted out).
+  const toggleContact = (id: string, on: boolean) => {
+    onChange({ ...value, contactOptOut: on ? value.contactOptOut.filter((g) => g !== id) : [...value.contactOptOut, id] });
   };
 
   const setTri = async (right: CatalogRight, next: TriState) => {
@@ -99,7 +113,16 @@ export function RightsConfigEditor({ services, groups, value, onChange, canManag
           ) : assignmentEditable ? (
             <Stack gap={2}>
               {groups.map((g) => (
-                <Checkbox key={g.id} checked={assigned.has(g.id)} onChange={(next) => toggleGroup(g.id, next)} label={g.label} />
+                <Stack key={g.id} direction="row" align="center" justify="between" gap={3}>
+                  <Checkbox checked={assigned.has(g.id)} onChange={(next) => toggleGroup(g.id, next)} label={g.label} />
+                  {g.contactVisibility && assigned.has(g.id) && (
+                    <Switch
+                      checked={!optedOut.has(g.id)}
+                      onChange={(on) => toggleContact(g.id, on)}
+                      label={t('privleg.contactVisibleShort')}
+                    />
+                  )}
+                </Stack>
               ))}
             </Stack>
           ) : (

@@ -190,13 +190,14 @@ func (s *Server) getCatalog(w http.ResponseWriter, _ *http.Request, _ *auth.User
 // assigned groups grant (ignoring overrides) — the UI uses it to label the "Gruppe" segment;
 // `effective` is the fully resolved set actually enforced.
 type grantsResp struct {
-	Username    string            `json:"username"`
-	DisplayName string            `json:"displayName"`
-	IsAdmin     bool              `json:"isAdmin"`
-	Groups      []string          `json:"groups"`
-	Overrides   map[string]string `json:"overrides"`
-	Inherited   []string          `json:"inherited"`
-	Effective   []string          `json:"effective"`
+	Username      string            `json:"username"`
+	DisplayName   string            `json:"displayName"`
+	IsAdmin       bool              `json:"isAdmin"`
+	Groups        []string          `json:"groups"`
+	ContactOptOut []string          `json:"contactOptOut"`
+	Overrides     map[string]string `json:"overrides"`
+	Inherited     []string          `json:"inherited"`
+	Effective     []string          `json:"effective"`
 }
 
 // materializableSet is the set of right keys that currently can be synced down (every
@@ -213,7 +214,7 @@ func (s *Server) materializableSet() map[string]bool {
 // currently-declared right with an "on"/"off" value, and every group id must exist. Returns
 // a client-facing message and false on the first problem. Shared by putGrants and the invite
 // config path.
-func (s *Server) validateConfig(groups []string, overrides map[string]string) (string, bool) {
+func (s *Server) validateConfig(groups []string, overrides map[string]string, contactOptOut []string) (string, bool) {
 	set := s.materializableSet()
 	for key, val := range overrides {
 		if !set[key] {
@@ -228,6 +229,11 @@ func (s *Server) validateConfig(groups []string, overrides map[string]string) (s
 		groupSet[g.ID] = true
 	}
 	for _, gid := range groups {
+		if !groupSet[gid] {
+			return "Unknown group: " + gid, false
+		}
+	}
+	for _, gid := range contactOptOut {
 		if !groupSet[gid] {
 			return "Unknown group: " + gid, false
 		}
@@ -247,14 +253,18 @@ func (s *Server) grantsFor(name string) grantsResp {
 	if cfg.Overrides == nil {
 		cfg.Overrides = map[string]string{}
 	}
+	if cfg.ContactOptOut == nil {
+		cfg.ContactOptOut = []string{}
+	}
 	return grantsResp{
-		Username:    u.Username,
-		DisplayName: u.DisplayName,
-		IsAdmin:     u.IsAdmin,
-		Groups:      cfg.Groups,
-		Overrides:   cfg.Overrides,
-		Inherited:   trueKeys(rights.InheritedRights(cfg, groups, set)),
-		Effective:   trueKeys(rights.Effective(cfg, groups, set)),
+		Username:      u.Username,
+		DisplayName:   u.DisplayName,
+		IsAdmin:       u.IsAdmin,
+		Groups:        cfg.Groups,
+		ContactOptOut: cfg.ContactOptOut,
+		Overrides:     cfg.Overrides,
+		Inherited:     trueKeys(rights.InheritedRights(cfg, groups, set)),
+		Effective:     trueKeys(rights.Effective(cfg, groups, set)),
 	}
 }
 
@@ -300,8 +310,9 @@ func (s *Server) putGrants(w http.ResponseWriter, r *http.Request, caller *auth.
 		return
 	}
 	var body struct {
-		Groups    []string          `json:"groups"`
-		Overrides map[string]string `json:"overrides"`
+		Groups        []string          `json:"groups"`
+		Overrides     map[string]string `json:"overrides"`
+		ContactOptOut []string          `json:"contactOptOut"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "Invalid request body")
@@ -313,18 +324,27 @@ func (s *Server) putGrants(w http.ResponseWriter, r *http.Request, caller *auth.
 	if body.Groups == nil {
 		body.Groups = []string{}
 	}
+	if body.ContactOptOut == nil {
+		body.ContactOptOut = []string{}
+	}
 
-	if msg, ok := s.validateConfig(body.Groups, body.Overrides); !ok {
+	if msg, ok := s.validateConfig(body.Groups, body.Overrides, body.ContactOptOut); !ok {
 		writeErr(w, http.StatusBadRequest, msg)
 		return
 	}
 
 	before := s.mat.BaselineConfig(name)
-	after := rights.UserConfig{Groups: dedupe(body.Groups), Overrides: body.Overrides}
+	after := rights.UserConfig{Groups: dedupe(body.Groups), Overrides: body.Overrides, ContactOptOut: dedupe(body.ContactOptOut)}
 
 	// Authorize the group-assignment delta (admin only).
 	if !sameSet(before.Groups, after.Groups) && !caller.IsAdmin {
 		writeErr(w, http.StatusForbidden, "Only admins may change group membership")
+		return
+	}
+	// Contact participation is a visibility decision (who sees whom), so like group assignment it is
+	// admin-only — a delegated service manager may not change it.
+	if !sameSet(before.ContactOptOut, after.ContactOptOut) && !caller.IsAdmin {
+		writeErr(w, http.StatusForbidden, "Only admins may change contact visibility")
 		return
 	}
 	// Authorize each changed override by its service.
@@ -471,10 +491,11 @@ func (s *Server) listInvites(w http.ResponseWriter, _ *http.Request, _ *auth.Use
 
 func (s *Server) createInvite(w http.ResponseWriter, r *http.Request, caller *auth.User) {
 	var body struct {
-		Note        string            `json:"note"`
-		ExpiresDays int               `json:"expiresDays"`
-		Groups      []string          `json:"groups"`
-		Overrides   map[string]string `json:"overrides"`
+		Note          string            `json:"note"`
+		ExpiresDays   int               `json:"expiresDays"`
+		Groups        []string          `json:"groups"`
+		Overrides     map[string]string `json:"overrides"`
+		ContactOptOut []string          `json:"contactOptOut"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "Invalid request body")
@@ -493,7 +514,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request, caller *au
 			writeErr(w, http.StatusForbidden, "Only admins may attach a rights configuration to an invite")
 			return
 		}
-		if msg, ok := s.validateConfig(body.Groups, body.Overrides); !ok {
+		if msg, ok := s.validateConfig(body.Groups, body.Overrides, body.ContactOptOut); !ok {
 			writeErr(w, http.StatusBadRequest, msg)
 			return
 		}
@@ -520,7 +541,7 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request, caller *au
 			writeErr(w, http.StatusInternalServerError, "The invite was created but its rights config could not be attached. Please revoke it and try again.")
 			return
 		}
-		if err := s.rs.SetInviteConfig(id, rights.UserConfig{Groups: dedupe(body.Groups), Overrides: body.Overrides}); err != nil {
+		if err := s.rs.SetInviteConfig(id, rights.UserConfig{Groups: dedupe(body.Groups), Overrides: body.Overrides, ContactOptOut: dedupe(body.ContactOptOut)}); err != nil {
 			log.Printf("privleg: store invite config for %s failed: %v", id, err)
 			if rerr := invites.Revoke(id); rerr != nil {
 				log.Printf("privleg: revoke after failed config store %s: %v", id, rerr)
@@ -570,35 +591,37 @@ func sanitizeNote(s string) string {
 // to a group's rights re-materializes every user assigned to it.
 
 type groupOut struct {
-	ID     string   `json:"id"`
-	Label  string   `json:"label"`
-	Rights []string `json:"rights"`
+	ID                string   `json:"id"`
+	Label             string   `json:"label"`
+	Rights            []string `json:"rights"`
+	ContactVisibility bool     `json:"contactVisibility"`
 }
 
 func (s *Server) listGroups(w http.ResponseWriter, _ *http.Request, _ *auth.User) {
 	gs := s.rs.ListGroups()
 	out := make([]groupOut, 0, len(gs))
 	for _, g := range gs {
-		out = append(out, groupOut{g.ID, g.Label, g.Rights})
+		out = append(out, groupOut{g.ID, g.Label, g.Rights, g.ContactVisibility})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"groups": out})
 }
 
 // validateGroupBody parses + validates the shared create/update body: a non-empty label and
 // rights keys that are all currently declared (deduped, sorted).
-func (s *Server) validateGroupBody(w http.ResponseWriter, r *http.Request) (string, []string, bool) {
+func (s *Server) validateGroupBody(w http.ResponseWriter, r *http.Request) (string, []string, bool, bool) {
 	var body struct {
-		Label  string   `json:"label"`
-		Rights []string `json:"rights"`
+		Label             string   `json:"label"`
+		Rights            []string `json:"rights"`
+		ContactVisibility bool     `json:"contactVisibility"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, "Invalid request body")
-		return "", nil, false
+		return "", nil, false, false
 	}
 	label := sanitizeLabel(body.Label)
 	if label == "" {
 		writeErr(w, http.StatusBadRequest, "A group name is required")
-		return "", nil, false
+		return "", nil, false, false
 	}
 	set := s.materializableSet()
 	seen := map[string]bool{}
@@ -606,7 +629,7 @@ func (s *Server) validateGroupBody(w http.ResponseWriter, r *http.Request) (stri
 	for _, k := range body.Rights {
 		if !set[k] {
 			writeErr(w, http.StatusBadRequest, "Unknown right: "+k)
-			return "", nil, false
+			return "", nil, false, false
 		}
 		if !seen[k] {
 			seen[k] = true
@@ -614,21 +637,21 @@ func (s *Server) validateGroupBody(w http.ResponseWriter, r *http.Request) (stri
 		}
 	}
 	sort.Strings(keys)
-	return label, keys, true
+	return label, keys, body.ContactVisibility, true
 }
 
 func (s *Server) createGroup(w http.ResponseWriter, r *http.Request, _ *auth.User) {
-	label, keys, ok := s.validateGroupBody(w, r)
+	label, keys, contactVisibility, ok := s.validateGroupBody(w, r)
 	if !ok {
 		return
 	}
-	g, err := s.rs.CreateGroup(label, keys)
+	g, err := s.rs.CreateGroup(label, keys, contactVisibility)
 	if err != nil {
 		log.Printf("privleg: create group failed: %v", err)
 		writeErr(w, http.StatusInternalServerError, "Failed to create the group")
 		return
 	}
-	writeJSON(w, http.StatusOK, groupOut{g.ID, g.Label, g.Rights})
+	writeJSON(w, http.StatusOK, groupOut{g.ID, g.Label, g.Rights, g.ContactVisibility})
 }
 
 func (s *Server) updateGroup(w http.ResponseWriter, r *http.Request, _ *auth.User) {
@@ -637,11 +660,11 @@ func (s *Server) updateGroup(w http.ResponseWriter, r *http.Request, _ *auth.Use
 		writeErr(w, http.StatusBadRequest, "Invalid group id")
 		return
 	}
-	label, keys, ok := s.validateGroupBody(w, r)
+	label, keys, contactVisibility, ok := s.validateGroupBody(w, r)
 	if !ok {
 		return
 	}
-	g, affected, err := s.rs.UpdateGroup(id, label, keys)
+	g, affected, err := s.rs.UpdateGroup(id, label, keys, contactVisibility)
 	if errors.Is(err, rights.ErrNotFound) {
 		writeErr(w, http.StatusNotFound, "Unknown group")
 		return
@@ -655,7 +678,7 @@ func (s *Server) updateGroup(w http.ResponseWriter, r *http.Request, _ *auth.Use
 	if err := s.mat.MaterializeAll(affected); err != nil {
 		log.Printf("privleg: re-materialize after group %s update: %v", id, err)
 	}
-	writeJSON(w, http.StatusOK, groupOut{g.ID, g.Label, g.Rights})
+	writeJSON(w, http.StatusOK, groupOut{g.ID, g.Label, g.Rights, g.ContactVisibility})
 }
 
 func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request, _ *auth.User) {
@@ -664,6 +687,9 @@ func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request, _ *auth.Use
 		writeErr(w, http.StatusBadRequest, "Invalid group id")
 		return
 	}
+	// Capture whether the group was a contact group BEFORE deleting, so we can drain its backing
+	// hc_ group afterwards (the deleted group no longer appears to the normal reconciler).
+	prev, existed := s.rs.Group(id)
 	affected, err := s.rs.DeleteGroup(id)
 	if errors.Is(err, rights.ErrNotFound) {
 		writeErr(w, http.StatusNotFound, "Unknown group")
@@ -675,6 +701,11 @@ func (s *Server) deleteGroup(w http.ResponseWriter, r *http.Request, _ *auth.Use
 	}
 	if err := s.mat.MaterializeAll(affected); err != nil {
 		log.Printf("privleg: re-materialize after group %s delete: %v", id, err)
+	}
+	if existed && prev.ContactVisibility {
+		if err := s.mat.PurgeContactGroup(id, affected); err != nil {
+			log.Printf("privleg: purge contact group after %s delete: %v", id, err)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

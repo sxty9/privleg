@@ -51,6 +51,7 @@ type shellCall struct{ on bool }
 type fakeApplier struct {
 	grants    []grantCall
 	shells    []shellCall
+	contacts  []grantCall
 	failGroup string
 }
 
@@ -63,6 +64,10 @@ func (f *fakeApplier) SetGrant(_, g string, on bool) error {
 }
 func (f *fakeApplier) SetShell(_ string, on bool) error {
 	f.shells = append(f.shells, shellCall{on})
+	return nil
+}
+func (f *fakeApplier) SetContactGrant(_, g string, on bool) error {
+	f.contacts = append(f.contacts, grantCall{g, on})
 	return nil
 }
 
@@ -123,7 +128,7 @@ func TestMaterializeGroupAndShellGrant(t *testing.T) {
 	}
 	ap := &fakeApplier{}
 	m, st := newTestMat(t, live, ap)
-	g, _ := st.CreateGroup("Eltern", []string{"hp_hostek_power", "remshel:shell:access"})
+	g, _ := st.CreateGroup("Eltern", []string{"hp_hostek_power", "remshel:shell:access"}, false)
 	_ = st.SetUser("alice", UserConfig{Groups: []string{g.ID}})
 
 	if err := m.Materialize("alice"); err != nil {
@@ -143,7 +148,7 @@ func TestMaterializeForceOffBeatsGroup(t *testing.T) {
 	}
 	ap := &fakeApplier{}
 	m, st := newTestMat(t, live, ap)
-	g, _ := st.CreateGroup("Eltern", []string{"hp_hostek_power"})
+	g, _ := st.CreateGroup("Eltern", []string{"hp_hostek_power"}, false)
 	_ = st.SetUser("alice", UserConfig{Groups: []string{g.ID}, Overrides: map[string]string{"hp_hostek_power": "off"}})
 
 	if err := m.Materialize("alice"); err != nil {
@@ -161,7 +166,7 @@ func TestMaterializeNoChangeWhenInSync(t *testing.T) {
 	}
 	ap := &fakeApplier{}
 	m, st := newTestMat(t, live, ap)
-	g, _ := st.CreateGroup("Eltern", []string{"hp_hostek_power"})
+	g, _ := st.CreateGroup("Eltern", []string{"hp_hostek_power"}, false)
 	_ = st.SetUser("alice", UserConfig{Groups: []string{g.ID}})
 	if err := m.Materialize("alice"); err != nil {
 		t.Fatal(err)
@@ -176,7 +181,7 @@ func TestMaterializeCollectsErrors(t *testing.T) {
 	ap := &fakeApplier{failGroup: "hp_hostek_power"}
 	m, st := newTestMat(t, live, ap)
 	// Two group rights to grant; one fails — the other must still be attempted.
-	g, _ := st.CreateGroup("All", []string{"hp_hostek_power", "hp_samba_family_write"})
+	g, _ := st.CreateGroup("All", []string{"hp_hostek_power", "hp_samba_family_write"}, false)
 	_ = st.SetUser("alice", UserConfig{Groups: []string{g.ID}})
 
 	err := m.Materialize("alice")
@@ -195,7 +200,7 @@ func TestReconcileInvitesAppliesToConsumer(t *testing.T) {
 	}
 	ap := &fakeApplier{}
 	m, st := newTestMat(t, live, ap)
-	g, _ := st.CreateGroup("Eltern", []string{"hp_hostek_power"})
+	g, _ := st.CreateGroup("Eltern", []string{"hp_hostek_power"}, false)
 	_ = st.SetInviteConfig("inv1", UserConfig{Groups: []string{g.ID}, Overrides: map[string]string{"remshel:shell:access": "on"}})
 
 	lookup := func(id string) (string, bool) {
@@ -289,7 +294,7 @@ func TestMaterializeAllBestEffort(t *testing.T) {
 	}}
 	ap := &fakeApplier{}
 	m, st := newTestMat(t, live, ap)
-	g, _ := st.CreateGroup("Eltern", []string{"hp_hostek_power"})
+	g, _ := st.CreateGroup("Eltern", []string{"hp_hostek_power"}, false)
 	_ = st.SetUser("alice", UserConfig{Groups: []string{g.ID}})
 	_ = st.SetUser("bob", UserConfig{Groups: []string{g.ID}})
 	names := []string{"alice", "bob"}
@@ -299,5 +304,86 @@ func TestMaterializeAllBestEffort(t *testing.T) {
 	}
 	if len(ap.grants) != 2 {
 		t.Errorf("both users should be materialized, got %v", ap.grants)
+	}
+}
+
+// --- contact-visibility materialization (one group definition = rights + contacts) ---
+
+func TestMaterializeContactGroupOn(t *testing.T) {
+	live := fakeLive{users: map[string]users.User{"alice": {Username: "alice"}}}
+	ap := &fakeApplier{}
+	m, st := newTestMat(t, live, ap)
+	// A contact-only group (no rights): assigning a member must materialise hc_<id> on and touch
+	// no rights groups.
+	g, _ := st.CreateGroup("Family", nil, true)
+	_ = st.SetUser("alice", UserConfig{Groups: []string{g.ID}})
+	if err := m.Materialize("alice"); err != nil {
+		t.Fatal(err)
+	}
+	hc := hcName(g.ID)
+	if len(ap.grants) != 0 {
+		t.Errorf("a contact-only group grants no rights, got %v", ap.grants)
+	}
+	if len(ap.contacts) != 1 || ap.contacts[0] != (grantCall{hc, true}) {
+		t.Errorf("expected one contact grant %s=on, got %v", hc, ap.contacts)
+	}
+}
+
+func TestMaterializeContactOptOutRemoves(t *testing.T) {
+	ap := &fakeApplier{}
+	st, _ := Open(filepath.Join(t.TempDir(), "rights.json"))
+	g, _ := st.CreateGroup("Family", nil, true)
+	hc := hcName(g.ID)
+	// Alice is live in the backing group, but opts out ⇒ she must be removed (visibility decoupled
+	// from rights: she keeps membership/rights, loses the contact web).
+	live := fakeLive{users: map[string]users.User{"alice": {Username: "alice", Groups: []string{hc}}}}
+	m := newMaterializer(st, testCatalog(t), live, ap)
+	_ = st.SetUser("alice", UserConfig{Groups: []string{g.ID}, ContactOptOut: []string{g.ID}})
+	if err := m.Materialize("alice"); err != nil {
+		t.Fatal(err)
+	}
+	if len(ap.contacts) != 1 || ap.contacts[0] != (grantCall{hc, false}) {
+		t.Errorf("opt-out should remove %s, got %v", hc, ap.contacts)
+	}
+}
+
+func TestMaterializeContactVisibilityOffRemoves(t *testing.T) {
+	ap := &fakeApplier{}
+	st, _ := Open(filepath.Join(t.TempDir(), "rights.json"))
+	g, _ := st.CreateGroup("Family", nil, true)
+	hc := hcName(g.ID)
+	// Turn the group's contact visibility OFF while a member is still live in the backing group:
+	// the reconciler must drain the now-stale membership.
+	if _, _, err := st.UpdateGroup(g.ID, "Family", nil, false); err != nil {
+		t.Fatal(err)
+	}
+	live := fakeLive{users: map[string]users.User{"alice": {Username: "alice", Groups: []string{hc}}}}
+	m := newMaterializer(st, testCatalog(t), live, ap)
+	_ = st.SetUser("alice", UserConfig{Groups: []string{g.ID}})
+	if err := m.Materialize("alice"); err != nil {
+		t.Fatal(err)
+	}
+	if len(ap.contacts) != 1 || ap.contacts[0] != (grantCall{hc, false}) {
+		t.Errorf("contact-off should remove %s, got %v", hc, ap.contacts)
+	}
+}
+
+func TestPurgeContactGroup(t *testing.T) {
+	ap := &fakeApplier{}
+	st, _ := Open(filepath.Join(t.TempDir(), "rights.json"))
+	g, _ := st.CreateGroup("Family", nil, true)
+	hc := hcName(g.ID)
+	live := fakeLive{users: map[string]users.User{"alice": {Username: "alice"}, "bob": {Username: "bob"}}}
+	m := newMaterializer(st, testCatalog(t), live, ap)
+	if err := m.PurgeContactGroup(g.ID, []string{"alice", "bob"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ap.contacts) != 2 {
+		t.Fatalf("purge should remove both members, got %v", ap.contacts)
+	}
+	for _, c := range ap.contacts {
+		if c.group != hc || c.on {
+			t.Errorf("purge call must be %s=off, got %v", hc, c)
+		}
 	}
 }

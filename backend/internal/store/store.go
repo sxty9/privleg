@@ -11,10 +11,11 @@ import (
 )
 
 const (
-	grantWrapper  = "/usr/local/sbin/privleg-grant"
-	adminWrapper  = "/usr/local/sbin/privleg-set-admin"
-	shellWrapper  = "/usr/local/sbin/privleg-set-shell"
-	deleteWrapper = "/usr/local/sbin/privleg-delete-user"
+	grantWrapper        = "/usr/local/sbin/privleg-grant"
+	contactGrantWrapper = "/usr/local/sbin/privleg-contact-grant"
+	adminWrapper        = "/usr/local/sbin/privleg-set-admin"
+	shellWrapper        = "/usr/local/sbin/privleg-set-shell"
+	deleteWrapper       = "/usr/local/sbin/privleg-delete-user"
 )
 
 func onOff(on bool) string {
@@ -41,6 +42,14 @@ func run(wrapper string, args ...string) error {
 // any group not declared in permissions.d, so an undeclared or protected group fails here.
 func SetGrant(username, group string, on bool) error {
 	return run(grantWrapper, username, group, onOff(on))
+}
+
+// SetContactGrant adds (on) or removes (off) a user to/from a contact-visibility group. The
+// wrapper rejects any group whose name is not hc_-prefixed (the security boundary — it can never
+// be tricked into touching sudo/family/smbusers or an hp_* rights group), and creates the group
+// on demand. This is the write side of the "a group can also define a contact web" model.
+func SetContactGrant(username, group string, on bool) error {
+	return run(contactGrantWrapper, username, group, onOff(on))
 }
 
 // SetAdmin adds (on) or removes (off) a user to/from the admin (sudo) group.

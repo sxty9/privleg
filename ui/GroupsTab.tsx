@@ -54,10 +54,10 @@ export function GroupsTab({ api, ui }: ServiceContextProps) {
         services={cat.data?.services ?? []}
         initial={editing === 'new' ? null : editing}
         onCancel={() => setEditing(null)}
-        onSave={async (label, rights) => {
+        onSave={async (label, rights, contactVisibility) => {
           try {
-            if (editing === 'new') await api.post('groups', { label, rights });
-            else await api.put(`groups/${editing.id}`, { label, rights });
+            if (editing === 'new') await api.post('groups', { label, rights, contactVisibility });
+            else await api.put(`groups/${editing.id}`, { label, rights, contactVisibility });
             ui.toast({ title: t('privleg.groupSaved'), variant: 'success' });
             setEditing(null);
             refresh();
@@ -76,7 +76,12 @@ export function GroupsTab({ api, ui }: ServiceContextProps) {
       sortable: true,
       sortValue: (g) => g.label.toLowerCase(),
       hideable: false,
-      render: (g) => <Text weight="semibold">{g.label}</Text>,
+      render: (g) => (
+        <Stack direction="row" align="center" gap={2}>
+          <Text weight="semibold">{g.label}</Text>
+          {g.contactVisibility && <Badge variant="accent">{t('privleg.badgeContact')}</Badge>}
+        </Stack>
+      ),
     },
     {
       key: 'rights',
@@ -135,13 +140,14 @@ interface EditorProps {
   services: CatalogResponse['services'];
   initial: RightsGroup | null;
   onCancel: () => void;
-  onSave: (label: string, rights: string[]) => Promise<void>;
+  onSave: (label: string, rights: string[], contactVisibility: boolean) => Promise<void>;
 }
 
 function GroupEditor({ services, initial, onCancel, onSave }: EditorProps) {
   const t = useT();
   const [label, setLabel] = useState(initial?.label ?? '');
   const [selected, setSelected] = useState<Set<string>>(new Set(initial?.rights ?? []));
+  const [contactVisibility, setContactVisibility] = useState(initial?.contactVisibility ?? false);
   const [busy, setBusy] = useState(false);
 
   const toggle = (key: string, on: boolean) => {
@@ -160,7 +166,7 @@ function GroupEditor({ services, initial, onCancel, onSave }: EditorProps) {
   async function submit() {
     setBusy(true);
     try {
-      await onSave(label.trim(), [...selected]);
+      await onSave(label.trim(), [...selected], contactVisibility);
     } finally {
       setBusy(false);
     }
@@ -183,9 +189,12 @@ function GroupEditor({ services, initial, onCancel, onSave }: EditorProps) {
       </Stack>
 
       <Panel title={initial ? t('privleg.editGroupTitle') : t('privleg.newGroupTitle')} className="p-4">
-        <Field label={t('privleg.groupNameLabel')} hint={t('privleg.groupNameHint')} className="max-w-[360px]">
-          <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder={t('privleg.groupNamePlaceholder')} maxLength={64} />
-        </Field>
+        <Stack gap={4}>
+          <Field label={t('privleg.groupNameLabel')} hint={t('privleg.groupNameHint')} className="max-w-[360px]">
+            <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder={t('privleg.groupNamePlaceholder')} maxLength={64} />
+          </Field>
+          <Switch checked={contactVisibility} onChange={setContactVisibility} label={t('privleg.contactGroupToggle')} />
+        </Stack>
       </Panel>
 
       <RightsCatalog services={services} control={control} emptyText={t('privleg.noServiceRights')} />

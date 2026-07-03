@@ -26,6 +26,9 @@ export interface RightsGroup {
   id: string;
   label: string;
   rights: string[];
+  // When true this group also defines a contact web: its members see each other as contacts
+  // (via contax). One group definition carries both functions — rights and contact visibility.
+  contactVisibility: boolean;
 }
 
 export interface GroupsResponse {
@@ -44,6 +47,8 @@ export interface GrantsResponse {
   displayName: string;
   isAdmin: boolean;
   groups: string[];
+  // ids of contact-visibility groups this user is assigned to but excluded from the contact web of.
+  contactOptOut: string[];
   overrides: Record<string, OverrideState>;
   inherited: string[];
   effective: string[];

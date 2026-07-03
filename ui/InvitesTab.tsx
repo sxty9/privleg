@@ -74,7 +74,7 @@ export function InvitesTab({ api, ui, user }: ServiceContextProps) {
   const [busy, setBusy] = useState(false);
   const [created, setCreated] = useState<string | null>(null);
   const [cfgEnabled, setCfgEnabled] = useState(false);
-  const [cfg, setCfg] = useState<RightsConfigValue>({ groups: [], overrides: {} });
+  const [cfg, setCfg] = useState<RightsConfigValue>({ groups: [], overrides: {}, contactOptOut: [] });
 
   // Seed the config with the current default-on rights the first time the section is enabled —
   // and retry once the catalog has loaded, so opening it before the catalog arrives still
@@ -87,7 +87,9 @@ export function InvitesTab({ api, ui, user }: ServiceContextProps) {
     }
     if (!seeded.current && services.length > 0) {
       seeded.current = true;
-      setCfg((c) => (c.groups.length === 0 && Object.keys(c.overrides).length === 0 ? { groups: [], overrides: defaultSeed(services) } : c));
+      setCfg((c) =>
+        c.groups.length === 0 && Object.keys(c.overrides).length === 0 ? { groups: [], overrides: defaultSeed(services), contactOptOut: [] } : c,
+      );
     }
   }, [cfgEnabled, services]);
 
@@ -99,13 +101,14 @@ export function InvitesTab({ api, ui, user }: ServiceContextProps) {
       if (cfgEnabled) {
         payload.groups = cfg.groups;
         payload.overrides = cfg.overrides;
+        payload.contactOptOut = cfg.contactOptOut;
       }
       const res = await api.post<CreatedInvite>('invites', payload);
       setCreated(res.code);
       setNote('');
       setDays('');
       setCfgEnabled(false);
-      setCfg({ groups: [], overrides: {} });
+      setCfg({ groups: [], overrides: {}, contactOptOut: [] });
       refresh();
     } catch (e) {
       ui.toast({ title: t('privleg.createCodeError'), description: (e as Error).message, variant: 'error' });

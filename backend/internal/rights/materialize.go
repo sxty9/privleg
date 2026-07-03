@@ -24,6 +24,7 @@ type Live interface {
 type Applier interface {
 	SetGrant(user, group string, on bool) error
 	SetShell(user string, on bool) error
+	SetContactGrant(user, hcGroup string, on bool) error
 }
 
 type liveOS struct{ ul *users.Lister }
@@ -36,6 +37,9 @@ type storeApplier struct{}
 
 func (storeApplier) SetGrant(u, g string, on bool) error { return store.SetGrant(u, g, on) }
 func (storeApplier) SetShell(u string, on bool) error    { return store.SetShell(u, on) }
+func (storeApplier) SetContactGrant(u, g string, on bool) error {
+	return store.SetContactGrant(u, g, on)
+}
 
 // Materializer bridges the config layer to live Linux state: it resolves a user's effective
 // rights and syncs their hp_* group membership + login shell to match, via the narrow root
@@ -180,6 +184,47 @@ func (m *Materializer) Materialize(name string) error {
 		}
 	}
 
+	// Contact-visibility groups: sync the backing hc_<id> membership to the user's participation.
+	// A user participates in a contact group's web iff they are ASSIGNED to it (cfg.Groups) and have
+	// not opted out (cfg.ContactOptOut). Membership in hc_<id> is exactly what the contax service
+	// reads to decide who sees whom, so this is the write side — parallel to the hp_* sync above and
+	// only ever touching hc_ groups this install manages (one per contact-enabled group definition).
+	assigned := map[string]bool{}
+	for _, gid := range cfg.Groups {
+		assigned[gid] = true
+	}
+	optOut := map[string]bool{}
+	for _, gid := range cfg.ContactOptOut {
+		optOut[gid] = true
+	}
+	// Manage the hc_<id> group of EVERY known group (not only contact-enabled ones): when a group's
+	// ContactVisibility is turned off, desired becomes false and this reconciler removes the now-stale
+	// memberships. (Deleting a group is handled separately by PurgeContactGroup, since a deleted group
+	// no longer appears here.)
+	managedHc := map[string]bool{}
+	desiredHc := map[string]bool{}
+	for _, g := range m.store.ListGroups() {
+		hc := hcName(g.ID)
+		managedHc[hc] = true
+		if g.ContactVisibility && assigned[g.ID] && !optOut[g.ID] {
+			desiredHc[hc] = true
+		}
+	}
+	currentHc := map[string]bool{}
+	for _, g := range live.Groups {
+		if managedHc[g] {
+			currentHc[g] = true
+		}
+	}
+	for hc := range managedHc {
+		if desiredHc[hc] != currentHc[hc] {
+			if err := m.apply.SetContactGrant(name, hc, desiredHc[hc]); err != nil {
+				log.Printf("privleg: materialize %s contact %s=%v: %v", name, hc, desiredHc[hc], err)
+				errs = append(errs, fmt.Sprintf("%s: %v", hc, err))
+			}
+		}
+	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("materialize %s: %v", name, errs)
 	}
@@ -280,7 +325,52 @@ func configEqual(a, b UserConfig) bool {
 			return false
 		}
 	}
+	// Contact opt-out set must match too, so an admin's edit of who participates in a contact web
+	// isn't silently reverted by the invite reconciler.
+	ao := map[string]bool{}
+	for _, g := range a.ContactOptOut {
+		ao[g] = true
+	}
+	bo := map[string]bool{}
+	for _, g := range b.ContactOptOut {
+		bo[g] = true
+	}
+	if len(ao) != len(bo) {
+		return false
+	}
+	for g := range ao {
+		if !bo[g] {
+			return false
+		}
+	}
 	return true
+}
+
+// hcName is the backing Linux contact group for a group id ("hc_" + id). Group ids are gen-xxxxxxxx,
+// already within the hc_ charset and length budget, so the derived name is always valid.
+func hcName(groupID string) string {
+	return "hc_" + groupID
+}
+
+// PurgeContactGroup removes the given members from a group's backing hc_<id> Linux group. Called
+// when a group is DELETED: after deletion the group no longer appears in ListGroups, so the normal
+// Materialize reconciler can't manage its hc_ group — this drains it explicitly so contax stops
+// treating former members as mutual contacts. Best-effort per member; admins are a harmless no-op.
+func (m *Materializer) PurgeContactGroup(groupID string, members []string) error {
+	hc := hcName(groupID)
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+	var errs []string
+	for _, name := range members {
+		if err := m.apply.SetContactGrant(name, hc, false); err != nil {
+			log.Printf("privleg: purge contact group %s for %s: %v", hc, name, err)
+			errs = append(errs, fmt.Sprintf("%s: %v", name, err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("purge contact group %s: %v", hc, errs)
+	}
+	return nil
 }
 
 // MaterializeAll reconciles many users, best-effort: every user is attempted even if some

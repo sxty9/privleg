@@ -25,7 +25,7 @@ func TestGroupCRUDAndPersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "rights.json")
 	s, _ := Open(path)
 
-	g, err := s.CreateGroup("Eltern", []string{"hp_hostek_power", "remshel:shell:access"})
+	g, err := s.CreateGroup("Eltern", []string{"hp_hostek_power", "remshel:shell:access"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestGroupCRUDAndPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, affected, err := s.UpdateGroup(g.ID, "Eltern+", []string{"hp_hostek_power"})
+	_, affected, err := s.UpdateGroup(g.ID, "Eltern+", []string{"hp_hostek_power"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestGroupCRUDAndPersistence(t *testing.T) {
 
 func TestUpdateDeleteUnknownGroup(t *testing.T) {
 	s, _ := Open(filepath.Join(t.TempDir(), "rights.json"))
-	if _, _, err := s.UpdateGroup("gen-deadbeef", "x", nil); !errors.Is(err, ErrNotFound) {
+	if _, _, err := s.UpdateGroup("gen-deadbeef", "x", nil, false); !errors.Is(err, ErrNotFound) {
 		t.Errorf("UpdateGroup unknown = %v, want ErrNotFound", err)
 	}
 	if _, err := s.DeleteGroup("gen-deadbeef"); !errors.Is(err, ErrNotFound) {
@@ -82,8 +82,8 @@ func TestUpdateDeleteUnknownGroup(t *testing.T) {
 
 func TestNewIDUnique(t *testing.T) {
 	s, _ := Open(filepath.Join(t.TempDir(), "rights.json"))
-	a, _ := s.CreateGroup("A", nil)
-	b, _ := s.CreateGroup("B", nil)
+	a, _ := s.CreateGroup("A", nil, false)
+	b, _ := s.CreateGroup("B", nil, false)
 	if a.ID == b.ID {
 		t.Error("generated group ids must be unique")
 	}

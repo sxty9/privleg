@@ -28,12 +28,18 @@ const DefaultPath = "/var/lib/privleg/rights.json"
 // ErrNotFound is returned when a group id does not exist.
 var ErrNotFound = errors.New("rights: group not found")
 
-// Group is an admin-defined rights group: a named bundle of declared rights. Rights are
-// catalog keys — a backing hp_* group, or a shell key "svc:cat:id".
+// Group is an admin-defined group. Primarily a named bundle of declared rights (catalog keys —
+// a backing hp_* group, or a shell key "svc:cat:id"), it may ALSO define contact visibility: one
+// group definition carries both functions (e.g. "Developer" grants dev rights AND makes its members
+// mutual contacts). A group may be rights-only, contact-only, or both.
 type Group struct {
 	ID     string   `json:"id"`
 	Label  string   `json:"label"`
 	Rights []string `json:"rights"`
+	// ContactVisibility turns this group into a contact web: privleg materialises a backing
+	// hc_<id> Linux group whose members are the participating (non-opted-out) assignees, and the
+	// contax service reads that group live to make those members see each other as contacts.
+	ContactVisibility bool `json:"contactVisibility,omitempty"`
 }
 
 // UserConfig is one user's rights configuration: the groups they belong to, plus per-right
@@ -42,6 +48,11 @@ type Group struct {
 type UserConfig struct {
 	Groups    []string          `json:"groups"`
 	Overrides map[string]string `json:"overrides"`
+	// ContactOptOut lists ids of contact-visibility groups this user is assigned to but is excluded
+	// from the contact web of (Model B: visibility decoupled from rights, so a member can keep a
+	// group's rights without appearing to the others). Default empty ⇒ participate in every assigned
+	// contact group.
+	ContactOptOut []string `json:"contactOptOut,omitempty"`
 }
 
 // State is the entire persisted config layer.
@@ -119,10 +130,10 @@ func (s *Store) Group(id string) (Group, bool) {
 }
 
 // CreateGroup appends a new group with a freshly generated id and persists it.
-func (s *Store) CreateGroup(label string, rightsKeys []string) (Group, error) {
+func (s *Store) CreateGroup(label string, rightsKeys []string, contactVisibility bool) (Group, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	g := Group{ID: s.newID(), Label: label, Rights: append([]string{}, rightsKeys...)}
+	g := Group{ID: s.newID(), Label: label, Rights: append([]string{}, rightsKeys...), ContactVisibility: contactVisibility}
 	s.st.Groups = append(s.st.Groups, g)
 	if err := s.save(); err != nil {
 		// roll back the in-memory append so a failed write doesn't leave a phantom group.
@@ -134,7 +145,7 @@ func (s *Store) CreateGroup(label string, rightsKeys []string) (Group, error) {
 
 // UpdateGroup replaces a group's label + rights, persists, and returns the updated group
 // plus the usernames currently assigned to it (so the caller can re-materialize them).
-func (s *Store) UpdateGroup(id, label string, rightsKeys []string) (Group, []string, error) {
+func (s *Store) UpdateGroup(id, label string, rightsKeys []string, contactVisibility bool) (Group, []string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	idx := -1
@@ -148,7 +159,7 @@ func (s *Store) UpdateGroup(id, label string, rightsKeys []string) (Group, []str
 		return Group{}, nil, ErrNotFound
 	}
 	prev := s.st.Groups[idx]
-	s.st.Groups[idx] = Group{ID: id, Label: label, Rights: append([]string{}, rightsKeys...)}
+	s.st.Groups[idx] = Group{ID: id, Label: label, Rights: append([]string{}, rightsKeys...), ContactVisibility: contactVisibility}
 	if err := s.save(); err != nil {
 		s.st.Groups[idx] = prev
 		return Group{}, nil, err
@@ -179,7 +190,7 @@ func (s *Store) DeleteGroup(id string) ([]string, error) {
 	s.st.Groups = append(append([]Group{}, s.st.Groups[:idx]...), s.st.Groups[idx+1:]...)
 	newUsers := make(map[string]UserConfig, len(s.st.Users))
 	for name, cfg := range s.st.Users {
-		newUsers[name] = UserConfig{Groups: without(cfg.Groups, id), Overrides: cfg.Overrides}
+		newUsers[name] = UserConfig{Groups: without(cfg.Groups, id), Overrides: cfg.Overrides, ContactOptOut: without(cfg.ContactOptOut, id)}
 	}
 	s.st.Users = newUsers
 	if err := s.save(); err != nil {
@@ -206,7 +217,7 @@ func (s *Store) SetUser(name string, cfg UserConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	prev, had := s.st.Users[name]
-	norm := UserConfig{Groups: append([]string{}, cfg.Groups...), Overrides: map[string]string{}}
+	norm := UserConfig{Groups: append([]string{}, cfg.Groups...), Overrides: map[string]string{}, ContactOptOut: append([]string{}, cfg.ContactOptOut...)}
 	for k, v := range cfg.Overrides {
 		norm.Overrides[k] = v
 	}
@@ -338,7 +349,7 @@ func (s *Store) newID() string {
 // --- value helpers (deep copies keep callers from aliasing internal state) ---
 
 func cloneGroup(g Group) Group {
-	return Group{ID: g.ID, Label: g.Label, Rights: append([]string{}, g.Rights...)}
+	return Group{ID: g.ID, Label: g.Label, Rights: append([]string{}, g.Rights...), ContactVisibility: g.ContactVisibility}
 }
 
 func cloneGroups(gs []Group) []Group {
@@ -350,7 +361,7 @@ func cloneGroups(gs []Group) []Group {
 }
 
 func cloneConfig(c UserConfig) UserConfig {
-	out := UserConfig{Groups: append([]string{}, c.Groups...), Overrides: map[string]string{}}
+	out := UserConfig{Groups: append([]string{}, c.Groups...), Overrides: map[string]string{}, ContactOptOut: append([]string{}, c.ContactOptOut...)}
 	for k, v := range c.Overrides {
 		out.Overrides[k] = v
 	}
