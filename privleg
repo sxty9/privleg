@@ -4,8 +4,10 @@
 # wrappers that toggle group membership. privleg is the MANAGEMENT plane for the holistic
 # rights standard; each service still ENFORCES its own rights via Linux group membership,
 # so a host without privleg behaves exactly as before. The systemd unit, Caddy route,
-# sudoers drop-in, the privileged wrappers, and privleg's own rights manifest are all
-# generated inline by `privleg setup` — this script is their source of truth.
+# sudoers drop-in, and the privileged wrappers are all generated inline by `privleg setup` —
+# this script is their source of truth. privleg's own rights manifest lives in-repo at
+# permissions/privleg.json (the same convention as every other holistic service) and is
+# installed from there.
 
 set -euo pipefail
 
@@ -337,73 +339,29 @@ EOF
   rm -f "$tmp"
 }
 
+# Declared rights groups, parsed from the manifest (single source of truth). Prefers the
+# repo copy; falls back to the installed drop-in (e.g. during uninstall, before it is removed).
+manifest_groups() {
+  local src="$REPO_ROOT/permissions/privleg.json"
+  [ -f "$src" ] || src="$PERMS_FILE"
+  [ -f "$src" ] || return 0
+  grep -oE '"group"[[:space:]]*:[[:space:]]*"hp_[a-z0-9_-]+"' "$src" | grep -oE 'hp_[a-z0-9_-]+'
+}
+
 write_permissions() {
   # privleg's OWN rights manifest (self-reference): it declares, through the same standard,
   # the meta-rights that let a NON-admin manage OTHER users' rights for a given service.
   # Granting these is admin-only (the daemon refuses to delegate privleg's own meta-rights).
+  # permissions/privleg.json is the single source of truth (same convention as every other
+  # holistic service); the daemon + UI mirror it. Install it where privleg discovers it and
+  # create the backing groups parsed from the manifest.
+  local src="$REPO_ROOT/permissions/privleg.json"
+  [ -f "$src" ] || die "missing $src — run from the repo root" 5
   install -d -o "$HOLISTIC_GROUP" -g "$HOLISTIC_GROUP" -m 0755 /etc/holistic/permissions.d 2>/dev/null \
     || install -d -m 0755 /etc/holistic/permissions.d
-  cat > "$PERMS_FILE" <<'JSON'
-{
-  "service": "privleg",
-  "version": 1,
-  "categories": [
-    {
-      "id": "delegation",
-      "label": "Rechte-Delegation",
-      "description": "Erlaubt einem Nicht-Admin, die Rechte ANDERER Benutzer für einen bestimmten Dienst zu verwalten. Admin-Status und privlegs eigene Delegationsrechte bleiben Admins vorbehalten.",
-      "permissions": [
-        {
-          "id": "manage-hostek",
-          "label": "hostek-Rechte verwalten",
-          "description": "Darf die hostek-Rechte anderer Benutzer setzen und entziehen.",
-          "group": "hp_priv_dlg_hostek",
-          "default": false
-        },
-        {
-          "id": "manage-samba",
-          "label": "samba-Rechte verwalten",
-          "description": "Darf die samba-Rechte anderer Benutzer setzen und entziehen.",
-          "group": "hp_priv_dlg_samba",
-          "default": false
-        }
-      ]
-    },
-    {
-      "id": "users",
-      "label": "Benutzer",
-      "description": "Einsicht in die Benutzerverwaltung.",
-      "permissions": [
-        {
-          "id": "view",
-          "label": "Benutzer ansehen",
-          "description": "Darf die Benutzerliste und ihre Rechte einsehen, ohne etwas zu ändern.",
-          "group": "hp_priv_view",
-          "default": false
-        }
-      ]
-    },
-    {
-      "id": "invites",
-      "label": "Einladungen",
-      "description": "Registrierungs-Einladungscodes für neue Konten erzeugen und verwalten.",
-      "permissions": [
-        {
-          "id": "manage",
-          "label": "Einladungscodes verwalten",
-          "description": "Neue Einladungscodes erzeugen, alle bestehenden einsehen und widerrufen. Mit einem solchen Code kann sich eine neue Person ein Konto anlegen.",
-          "group": "hp_priv_invite",
-          "default": false,
-          "dangerous": true
-        }
-      ]
-    }
-  ]
-}
-JSON
-  chmod 0644 "$PERMS_FILE"
+  install -m 0644 "$src" "$PERMS_FILE"
   local g
-  for g in hp_priv_dlg_hostek hp_priv_dlg_samba hp_priv_view hp_priv_invite; do
+  for g in $(manifest_groups); do
     groupadd -f "$g"
   done
 }
@@ -591,7 +549,7 @@ cmd_uninstall() {
     userdel "$PRIVLEG_USER" >/dev/null 2>&1 || true
     groupdel "$PRIVLEG_USER" >/dev/null 2>&1 || true
     local g
-    for g in hp_priv_dlg_hostek hp_priv_dlg_samba hp_priv_view hp_priv_invite; do
+    for g in $(manifest_groups); do
       groupdel "$g" >/dev/null 2>&1 || true
     done
     rm -rf "$PRIVLEG_APP" /var/lib/privleg

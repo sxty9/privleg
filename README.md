@@ -18,9 +18,11 @@ managers.
 
 ## How it works
 
-privleg follows the same pattern as hostek: a single-file bash CLI generates all system
-artifacts inline, an unprivileged Go daemon (`privlegd`) serves `/api/services/privleg/*`
-behind the shared holistic JWT session, and a `@holistic/ui` plugin provides the UI.
+privleg follows the same pattern as hostek: a single-file bash CLI generates the system
+artifacts (systemd unit, Caddy route, sudoers, wrappers) inline and installs its rights
+manifest from `permissions/privleg.json`, an unprivileged Go daemon (`privlegd`) serves
+`/api/services/privleg/*` behind the shared holistic JWT session, and a `@holistic/ui`
+plugin provides the UI.
 
 - **Rights = Linux groups.** Every fine-grained right a service offers is declared in
   `/etc/holistic/permissions.d/<service>.json` and backed 1:1 by an `hp_*` Linux group.
@@ -77,14 +79,17 @@ Errors use holistic's `{"detail": "..."}` contract.
 
 ```
 privleg                         single-file CLI (setup/lifecycle/wrappers source of truth)
+permissions/privleg.json        privleg's own rights manifest (single source of truth for its
+                                hp_priv_* groups; installed to /etc/holistic/permissions.d/ by setup)
 backend/cmd/privlegd/main.go    daemon entry point (127.0.0.1:8772)
 backend/internal/auth/          shared-JWT session validation (live Linux groups)
 backend/internal/catalog/       reads permissions.d → manifests + group→service index
 backend/internal/users/         enumerates smbusers members, resolves admin + rights
-backend/internal/store/         applies rights changes via the two root wrappers
+backend/internal/rights/        rights-groups config layer + materializer (syncs hp_*/hc_* + shell)
+backend/internal/store/         applies rights changes via the root wrappers
 backend/internal/invites/       reads the invite store; mints/revokes via the invite wrappers
 backend/internal/api/           routes, auth gates, delegation enforcement
-ui/                             @holistic/ui plugin (Users + Rights editor, Invites)
+ui/                             @holistic/ui plugin (Users + Rights editor, Groups, Invites)
 ```
 
 ## Requirements
