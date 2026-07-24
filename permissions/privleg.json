@@ -1,0 +1,56 @@
+{
+  "service": "privleg",
+  "version": 1,
+  "categories": [
+    {
+      "id": "delegation",
+      "label": "Rechte-Delegation",
+      "description": "Erlaubt einem Nicht-Admin, die Rechte ANDERER Benutzer für einen bestimmten Dienst zu verwalten. Admin-Status und privlegs eigene Delegationsrechte bleiben Admins vorbehalten.",
+      "permissions": [
+        {
+          "id": "manage-hostek",
+          "label": "hostek-Rechte verwalten",
+          "description": "Darf die hostek-Rechte anderer Benutzer setzen und entziehen.",
+          "group": "hp_priv_dlg_hostek",
+          "default": false
+        },
+        {
+          "id": "manage-samba",
+          "label": "samba-Rechte verwalten",
+          "description": "Darf die samba-Rechte anderer Benutzer setzen und entziehen.",
+          "group": "hp_priv_dlg_samba",
+          "default": false
+        }
+      ]
+    },
+    {
+      "id": "users",
+      "label": "Benutzer",
+      "description": "Einsicht in die Benutzerverwaltung.",
+      "permissions": [
+        {
+          "id": "view",
+          "label": "Benutzer ansehen",
+          "description": "Darf die Benutzerliste und ihre Rechte einsehen, ohne etwas zu ändern.",
+          "group": "hp_priv_view",
+          "default": false
+        }
+      ]
+    },
+    {
+      "id": "invites",
+      "label": "Einladungen",
+      "description": "Registrierungs-Einladungscodes für neue Konten erzeugen und verwalten.",
+      "permissions": [
+        {
+          "id": "manage",
+          "label": "Einladungscodes verwalten",
+          "description": "Neue Einladungscodes erzeugen, alle bestehenden einsehen und widerrufen. Mit einem solchen Code kann sich eine neue Person ein Konto anlegen.",
+          "group": "hp_priv_invite",
+          "default": false,
+          "dangerous": true
+        }
+      ]
+    }
+  ]
+}

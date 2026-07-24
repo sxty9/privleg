@@ -72,9 +72,6 @@ func NewVerifier(secret []byte, adminGroup string) *Verifier {
 	return &Verifier{secret: secret, adminGroup: adminGroup}
 }
 
-// AdminGroup returns the Linux group that confers admin.
-func (v *Verifier) AdminGroup() string { return v.adminGroup }
-
 // User extracts and validates the session from the request.
 func (v *Verifier) User(r *http.Request) (*User, error) {
 	c, err := r.Cookie(accessCookie)
