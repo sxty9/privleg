@@ -1,7 +1,9 @@
 package rights
 
 import (
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -153,6 +155,57 @@ func TestInviteConfigRoundtrip(t *testing.T) {
 	}
 	if err := s2.DeleteInviteConfig("missing"); err != nil {
 		t.Errorf("deleting a missing invite config must be a no-op: %v", err)
+	}
+}
+
+// TestSaveLeavesNoTornOrTempFile pins the atomic-write contract: after a committed mutation
+// the destination is a complete, parseable snapshot and no ".tmp" sidecar survives — a reader
+// arriving at any moment sees whole JSON, never a truncated in-between.
+func TestSaveLeavesNoTornOrTempFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rights.json")
+	s, _ := Open(path)
+	if _, err := s.CreateGroup("Team", []string{"hp_x"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Errorf("a committed save must not leave a temp sidecar behind (stat err = %v)", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st State
+	if err := json.Unmarshal(b, &st); err != nil {
+		t.Errorf("persisted file is not complete, valid JSON: %v", err)
+	}
+	if len(st.Groups) != 1 {
+		t.Errorf("persisted state should hold the one group, got %d", len(st.Groups))
+	}
+}
+
+// TestSaveOverwritesStaleTempFile ensures a temp file left behind by a crashed earlier write
+// (fixed ".tmp" name) can never corrupt the next save: it is truncated + reused and the commit
+// still yields exactly the new state.
+func TestSaveOverwritesStaleTempFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rights.json")
+	if err := os.WriteFile(path+".tmp", []byte("garbage-not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := Open(path)
+	if _, err := s.CreateGroup("Team", nil, false); err != nil {
+		t.Fatalf("a stale temp file must not break the next save: %v", err)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Errorf("stale temp should be consumed by the atomic rename, stat err = %v", err)
+	}
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen after stale-temp save: %v", err)
+	}
+	if len(s2.ListGroups()) != 1 {
+		t.Errorf("committed state should have 1 group, got %d", len(s2.ListGroups()))
 	}
 }
 

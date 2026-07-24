@@ -8,9 +8,10 @@
 // invisible to every other service.
 //
 // The store is privleg-private (unlike the shared invite store): privlegd owns
-// /var/lib/privleg and reads+writes rights.json directly, atomically (temp + rename within
-// the same dir, since PrivateTmp puts /tmp elsewhere). A single process is the only writer,
-// so an in-memory snapshot guarded by one mutex is the whole concurrency story.
+// /var/lib/privleg and reads+writes rights.json directly, atomically and durably (fsync'd
+// temp + rename within the same dir, since PrivateTmp puts /tmp elsewhere — see
+// writeFileAtomic). A single process is the only writer, so an in-memory snapshot guarded by
+// one mutex is the whole concurrency story.
 package rights
 
 import (
@@ -19,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -97,17 +99,59 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-// save writes the current state atomically. The caller must hold s.mu.
+// save writes the current state atomically and durably. The caller must hold s.mu.
 func (s *Store) save() error {
 	b, err := json.MarshalIndent(s.st, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	return writeFileAtomic(s.path, b, 0o600)
+}
+
+// writeFileAtomic writes data to path so that neither a concurrent reader nor a crash can
+// ever observe a half-written file. It writes a sibling temp file, fsyncs it so the bytes
+// reach disk BEFORE the file becomes visible, atomically renames it over path (POSIX rename
+// is atomic), then best-effort fsyncs the directory so the rename itself survives a crash.
+// Either the whole previous file or the whole new file is ever observable — never a truncated
+// or zero-length in-between.
+//
+// A plain WriteFile+Rename gives the atomic *swap* but not durability: a crash right after
+// the rename could surface a zero-length rights.json, an observable intermediate state the
+// store must never persist. The temp file is removed if anything fails before the rename
+// commits, so a failed write leaves the previous file untouched (the callers' rollback of the
+// in-memory snapshot then restores the match).
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	// Best-effort: fsync the directory so the rename (the actual commit) is durable. Not every
+	// filesystem supports directory fsync, and a failure here does not undo the atomic replace,
+	// so it is deliberately non-fatal.
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 // ListGroups returns a deep copy of all groups.
