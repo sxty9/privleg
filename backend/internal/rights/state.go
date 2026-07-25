@@ -255,20 +255,14 @@ func (s *Store) GetUser(name string) (UserConfig, bool) {
 	return cloneConfig(cfg), true
 }
 
-// SetUser stores a user's config and persists. Nil slices/maps are normalized to empty so
-// the on-disk JSON is stable.
+// SetUser stores a user's config and persists. Nil slices/maps are normalized to empty so the
+// on-disk JSON is stable — that normalization lives in cloneConfig, the single place both write
+// paths (here and AdoptUserConfig) route through, so they can never drift apart.
 func (s *Store) SetUser(name string, cfg UserConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	prev, had := s.st.Users[name]
-	norm := UserConfig{Groups: append([]string{}, cfg.Groups...), Overrides: map[string]string{}, ContactOptOut: append([]string{}, cfg.ContactOptOut...)}
-	for k, v := range cfg.Overrides {
-		norm.Overrides[k] = v
-	}
-	if norm.Groups == nil {
-		norm.Groups = []string{}
-	}
-	s.st.Users[name] = norm
+	s.st.Users[name] = cloneConfig(cfg)
 	if err := s.save(); err != nil {
 		if had {
 			s.st.Users[name] = prev
@@ -278,6 +272,29 @@ func (s *Store) SetUser(name string, cfg UserConfig) error {
 		return err
 	}
 	return nil
+}
+
+// AdoptUserConfig atomically installs cfg as name's configuration, but ONLY if name has no
+// stored configuration yet; it reports whether it did and returns the configuration now in
+// force. It is the store's compare-and-set: the invite reconciler must read "is this user
+// already configured?" and, only if not, adopt the invite config — as one indivisible step.
+// Split into a separate GetUser + SetUser, a concurrent admin edit landing between the two
+// would be silently clobbered (the reconciler reverting an admin's fresh config back to the
+// invite defaults) — exactly the observable intermediate state the atomicity axiom forbids.
+// Returning the in-force config lets the caller decide its next move without a second, racy read.
+func (s *Store) AdoptUserConfig(name string, cfg UserConfig) (UserConfig, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.st.Users[name]; ok {
+		return cloneConfig(existing), false, nil
+	}
+	norm := cloneConfig(cfg)
+	s.st.Users[name] = norm
+	if err := s.save(); err != nil {
+		delete(s.st.Users, name)
+		return UserConfig{}, false, err
+	}
+	return cloneConfig(norm), true, nil
 }
 
 // DeleteUser drops a user's stored config (e.g. when their account is deleted), so a later
