@@ -268,21 +268,26 @@ func (m *Materializer) ReconcileInvites(lookup InviteLookup) error {
 			_ = m.store.DeleteInviteConfig(id) // never configure admins
 			continue
 		}
-		existing, has := m.store.GetUser(usedBy)
-		if !has {
-			// First pass: adopt the invite config as the user's config and materialize, but keep
-			// the invite config one more round (see the two-pass note above).
-			if err := m.store.SetUser(usedBy, cfg); err != nil {
-				errs = append(errs, fmt.Sprintf("%s: %v", usedBy, err))
-				continue
-			}
+		// First pass adopts the invite config as the user's config — but reading "does this user
+		// have a config yet?" and writing "…then adopt it" must be ONE atomic step. A concurrent
+		// admin edit landing between a separate read and write would be silently clobbered, the
+		// reconciler reverting an admin's fresh config to the invite defaults. AdoptUserConfig does
+		// the check-and-set under a single lock and hands back whichever config is now in force.
+		current, adopted, err := m.store.AdoptUserConfig(usedBy, cfg)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", usedBy, err))
+			continue
+		}
+		if adopted {
+			// Materialize now, but keep the invite config one more round (see the two-pass note
+			// above) so a late grant_defaults can't undo it.
 			if err := m.Materialize(usedBy); err != nil {
 				log.Printf("privleg: materialize invite config for %s: %v", usedBy, err)
 			}
 			continue
 		}
-		if !configEqual(existing, cfg) {
-			_ = m.store.DeleteInviteConfig(id) // admin has edited them — don't re-assert
+		if !configEqual(current, cfg) {
+			_ = m.store.DeleteInviteConfig(id) // admin has configured/edited them — don't re-assert
 			continue
 		}
 		// Second pass: re-assert (now reliably after grant_defaults), then drop.

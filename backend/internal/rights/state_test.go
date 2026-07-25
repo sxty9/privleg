@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -206,6 +209,135 @@ func TestSaveOverwritesStaleTempFile(t *testing.T) {
 	}
 	if len(s2.ListGroups()) != 1 {
 		t.Errorf("committed state should have 1 group, got %d", len(s2.ListGroups()))
+	}
+}
+
+// TestAdoptUserConfig pins the compare-and-set contract: adopt only when the user is absent,
+// never clobber an existing config, always hand back a deep copy of the config now in force.
+func TestAdoptUserConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rights.json")
+	s, _ := Open(path)
+
+	// Absent → adopts, reports adopted, persists.
+	cur, adopted, err := s.AdoptUserConfig("newbie", UserConfig{Overrides: map[string]string{"hp_x": "on"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !adopted {
+		t.Fatal("adopting an absent user must report adopted=true")
+	}
+	if cur.Overrides["hp_x"] != "on" {
+		t.Errorf("adopt must return the in-force config, got %+v", cur)
+	}
+	if cfg, ok := s.GetUser("newbie"); !ok || cfg.Overrides["hp_x"] != "on" {
+		t.Errorf("adopted config must be persisted, got %+v ok=%v", cfg, ok)
+	}
+
+	// Present → does NOT clobber, reports not adopted, returns the EXISTING config.
+	cur, adopted, err = s.AdoptUserConfig("newbie", UserConfig{Overrides: map[string]string{"hp_x": "off"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adopted {
+		t.Error("adopt must not overwrite an already-configured user")
+	}
+	if cur.Overrides["hp_x"] != "on" {
+		t.Errorf("adopt must return the pre-existing config, got %+v", cur)
+	}
+	if cfg, _ := s.GetUser("newbie"); cfg.Overrides["hp_x"] != "on" {
+		t.Errorf("existing config must remain untouched, got %+v", cfg)
+	}
+
+	// The returned config is a deep copy — mutating it must not corrupt the store.
+	cur.Overrides["hp_x"] = "mutated"
+	if cfg, _ := s.GetUser("newbie"); cfg.Overrides["hp_x"] != "on" {
+		t.Error("AdoptUserConfig must return a deep copy, not an alias into the store")
+	}
+}
+
+// TestConcurrentAdoptElectsExactlyOneWriter exercises the atomicity axiom directly: many
+// goroutines race to adopt the SAME user, each with a distinct config. Compare-and-set under one
+// lock must elect exactly one adopter; every other caller must observe a whole config (never a
+// torn or half-applied one), and the persisted file must stay complete, valid JSON. Run -race.
+func TestConcurrentAdoptElectsExactlyOneWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rights.json")
+	s, _ := Open(path)
+
+	const goroutines = 32
+	var wg sync.WaitGroup
+	var adoptedCount int64
+	winner := make(chan string, goroutines)
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			val := "v" + strconv.Itoa(i)
+			cur, adopted, err := s.AdoptUserConfig("racer", UserConfig{Overrides: map[string]string{"k": val}})
+			if err != nil {
+				t.Errorf("adopt: %v", err)
+				return
+			}
+			if adopted {
+				atomic.AddInt64(&adoptedCount, 1)
+				winner <- val
+			}
+			// Winner or not, every caller must see a fully-formed config, never an empty/torn one.
+			if cur.Overrides["k"] == "" {
+				t.Errorf("adopt returned an incomplete config: %+v", cur)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(winner)
+	if adoptedCount != 1 {
+		t.Fatalf("exactly one goroutine may adopt, got %d", adoptedCount)
+	}
+	won := <-winner
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st State
+	if err := json.Unmarshal(b, &st); err != nil {
+		t.Fatalf("persisted file must stay valid JSON under concurrency: %v", err)
+	}
+	if got := st.Users["racer"].Overrides["k"]; got != won {
+		t.Errorf("persisted config = %q, want the elected winner %q", got, won)
+	}
+}
+
+// TestConcurrentMixedWritesStayConsistent hammers the store with different mutating methods from
+// many goroutines at once; the single mutex must serialize every writer so the on-disk file is
+// never observed torn and always reopens cleanly. Run under -race to catch unsynchronized access.
+func TestConcurrentMixedWritesStayConsistent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rights.json")
+	s, _ := Open(path)
+	var wg sync.WaitGroup
+	for i := 0; i < 24; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			switch i % 4 {
+			case 0:
+				_, _ = s.CreateGroup("g"+strconv.Itoa(i), []string{"hp_x"}, false)
+			case 1:
+				_ = s.SetUser("u"+strconv.Itoa(i), UserConfig{Overrides: map[string]string{"hp_x": "on"}})
+			case 2:
+				_ = s.SetInviteConfig("inv"+strconv.Itoa(i), UserConfig{Groups: []string{"g"}})
+			case 3:
+				_, _, _ = s.AdoptUserConfig("a"+strconv.Itoa(i), UserConfig{Overrides: map[string]string{"hp_y": "off"}})
+			}
+		}(i)
+	}
+	wg.Wait()
+	// Whatever the interleaving, the persisted file must be one valid snapshot that reopens cleanly.
+	if _, err := Open(path); err != nil {
+		t.Fatalf("store must reopen after concurrent writes: %v", err)
+	}
+	b, _ := os.ReadFile(path)
+	var st State
+	if err := json.Unmarshal(b, &st); err != nil {
+		t.Fatalf("persisted file must stay valid JSON under concurrency: %v", err)
 	}
 }
 
