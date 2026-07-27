@@ -21,6 +21,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 )
 
@@ -377,7 +378,7 @@ func (s *Store) InviteConfigIDs() []string {
 func (s *Store) membersOf(id string) []string {
 	var out []string
 	for name, cfg := range s.st.Users {
-		if contains(cfg.Groups, id) {
+		if slices.Contains(cfg.Groups, id) {
 			out = append(out, name)
 		}
 	}
@@ -430,15 +431,6 @@ func cloneConfig(c UserConfig) UserConfig {
 		out.Groups = []string{}
 	}
 	return out
-}
-
-func contains(xs []string, want string) bool {
-	for _, x := range xs {
-		if x == want {
-			return true
-		}
-	}
-	return false
 }
 
 func without(xs []string, drop string) []string {

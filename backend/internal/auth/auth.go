@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"slices"
 	"strings"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -37,7 +38,7 @@ type User struct {
 // standard: admins implicitly hold every right, otherwise membership in the backing
 // Linux group decides.
 func (u *User) Can(group string) bool {
-	return u.IsAdmin || contains(u.Groups, group)
+	return u.IsAdmin || slices.Contains(u.Groups, group)
 }
 
 // Verifier holds the shared signing secret and the group that confers admin.
@@ -104,7 +105,7 @@ func (v *Verifier) User(r *http.Request) (*User, error) {
 	if !exists {
 		return nil, ErrNoSession
 	}
-	return &User{Username: sub, Groups: groups, IsAdmin: contains(groups, v.adminGroup)}, nil
+	return &User{Username: sub, Groups: groups, IsAdmin: slices.Contains(groups, v.adminGroup)}, nil
 }
 
 // CheckCSRF enforces the double-submit guard: header X-CSRF-Token must equal the
@@ -140,13 +141,4 @@ func resolveGroups(username string) ([]string, bool) {
 		}
 	}
 	return groups, exists
-}
-
-func contains(xs []string, want string) bool {
-	for _, x := range xs {
-		if x == want {
-			return true
-		}
-	}
-	return false
 }

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -70,7 +71,7 @@ func TestGroupCRUDAndPersistence(t *testing.T) {
 		t.Errorf("DeleteGroup affected = %v, want [alice]", affected)
 	}
 	cfg, _ := s2.GetUser("alice")
-	if contains(cfg.Groups, g.ID) {
+	if slices.Contains(cfg.Groups, g.ID) {
 		t.Error("deleting a group must strip it from every user's assignment")
 	}
 }
@@ -144,7 +145,7 @@ func TestInviteConfigRoundtrip(t *testing.T) {
 	// Persists across reopen.
 	s2, _ := Open(path)
 	cfg, ok := s2.InviteConfig("inv1")
-	if !ok || !contains(cfg.Groups, "g1") || cfg.Overrides["hp_x"] != "off" {
+	if !ok || !slices.Contains(cfg.Groups, "g1") || cfg.Overrides["hp_x"] != "off" {
 		t.Errorf("invite config roundtrip failed: %+v ok=%v", cfg, ok)
 	}
 	if ids := s2.InviteConfigIDs(); len(ids) != 1 || ids[0] != "inv1" {
