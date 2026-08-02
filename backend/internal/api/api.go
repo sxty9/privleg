@@ -17,6 +17,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -136,7 +137,7 @@ func (s *Server) canManageService(u *auth.User, svc string) bool {
 	if svc == privService {
 		return false
 	}
-	return contains(u.Groups, dlgPrefix+svc)
+	return slices.Contains(u.Groups, dlgPrefix+svc)
 }
 
 // --- handlers ------------------------------------------------------------
@@ -157,18 +158,11 @@ func (s *Server) listUsers(w http.ResponseWriter, _ *http.Request, _ *auth.User)
 	writeJSON(w, http.StatusOK, map[string]any{"users": out})
 }
 
-// rightsFor returns the declared rights a user currently holds: the backing groups they
-// belong to, plus any shell-permission keys when their login shell is enabled (the single
-// source of truth). Shell perms have no group, so they are reported by their "svc:cat:id".
+// rightsFor returns the declared rights a user currently holds. The derivation (backing
+// groups they belong to + shell keys when their login shell is enabled) is owned by the
+// catalog, so this view and the materializer's migration baseline stay in exact agreement.
 func (s *Server) rightsFor(u users.User) []string {
-	out := filterDeclared(u.Groups, s.cat.DeclaredSet())
-	if shellSet := s.cat.ShellPermSet(); len(shellSet) > 0 && users.ShellEnabled(u.Username) {
-		for k := range shellSet {
-			out = append(out, k)
-		}
-	}
-	sort.Strings(out)
-	return out
+	return s.cat.HeldRights(u.Groups, users.ShellEnabled(u.Username))
 }
 
 // outFor builds the per-user response (identity + currently held rights).
@@ -200,22 +194,12 @@ type grantsResp struct {
 	Effective     []string          `json:"effective"`
 }
 
-// materializableSet is the set of right keys that currently can be synced down (every
-// declared backing-group right + shell right).
-func (s *Server) materializableSet() map[string]bool {
-	set := map[string]bool{}
-	for _, r := range s.cat.Rights() {
-		set[r.Key] = true
-	}
-	return set
-}
-
 // validateConfig checks a {groups, overrides} rights config: every override key must be a
 // currently-declared right with an "on"/"off" value, and every group id must exist. Returns
 // a client-facing message and false on the first problem. Shared by putGrants and the invite
 // config path.
 func (s *Server) validateConfig(groups []string, overrides map[string]string, contactOptOut []string) (string, bool) {
-	set := s.materializableSet()
+	set := s.cat.RightKeySet()
 	for key, val := range overrides {
 		if !set[key] {
 			return "Unknown right: " + key, false
@@ -245,7 +229,7 @@ func (s *Server) validateConfig(groups []string, overrides map[string]string, co
 func (s *Server) grantsFor(name string) grantsResp {
 	u := s.ul.Resolve(name)
 	cfg := s.mat.BaselineConfig(name)
-	set := s.materializableSet()
+	set := s.cat.RightKeySet()
 	groups := s.rs.ListGroups()
 	if cfg.Groups == nil {
 		cfg.Groups = []string{}
@@ -623,7 +607,7 @@ func (s *Server) validateGroupBody(w http.ResponseWriter, r *http.Request) (stri
 		writeErr(w, http.StatusBadRequest, "A group name is required")
 		return "", nil, false, false
 	}
-	set := s.materializableSet()
+	set := s.cat.RightKeySet()
 	seen := map[string]bool{}
 	keys := []string{}
 	for _, k := range body.Rights {
@@ -791,26 +775,6 @@ func sanitizeLabel(s string) string {
 		s = strings.TrimSpace(s[:labelMax])
 	}
 	return s
-}
-
-func filterDeclared(groups []string, declared map[string]bool) []string {
-	out := []string{}
-	for _, g := range groups {
-		if declared[g] {
-			out = append(out, g)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-func contains(xs []string, want string) bool {
-	for _, x := range xs {
-		if x == want {
-			return true
-		}
-	}
-	return false
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

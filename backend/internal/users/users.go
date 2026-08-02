@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -92,7 +93,7 @@ func (l *Lister) Resolve(username string) User {
 	return User{
 		Username:    username,
 		DisplayName: display,
-		IsAdmin:     contains(groups, l.adminGroup),
+		IsAdmin:     slices.Contains(groups, l.adminGroup),
 		Groups:      groups,
 	}
 }
@@ -135,13 +136,4 @@ func ShellEnabled(username string) bool {
 		return false
 	}
 	return true
-}
-
-func contains(xs []string, want string) bool {
-	for _, x := range xs {
-		if x == want {
-			return true
-		}
-	}
-	return false
 }

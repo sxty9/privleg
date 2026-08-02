@@ -3,7 +3,6 @@ package rights
 import (
 	"fmt"
 	"log"
-	"sort"
 	"sync"
 
 	"privleg/internal/catalog"
@@ -62,32 +61,6 @@ func newMaterializer(st *Store, cat *catalog.Catalog, live Live, apply Applier) 
 	return &Materializer{store: st, cat: cat, live: live, apply: apply}
 }
 
-// heldRights returns the declared rights a user currently holds live: backing groups they
-// belong to, plus every shell key when their login shell is enabled. Mirrors the API's
-// rightsFor — it's the source of truth for the lazy migration baseline.
-func (m *Materializer) heldRights(u users.User) []string {
-	declaredGroups := map[string]bool{}
-	var shellKeys []string
-	for _, r := range m.cat.Rights() {
-		if r.Kind == "shell" {
-			shellKeys = append(shellKeys, r.Key)
-		} else {
-			declaredGroups[r.Key] = true
-		}
-	}
-	out := []string{}
-	for _, g := range u.Groups {
-		if declaredGroups[g] {
-			out = append(out, g)
-		}
-	}
-	if m.live.ShellEnabled(u.Username) {
-		out = append(out, shellKeys...)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // BaselineConfig returns a user's effective config WITHOUT persisting: the stored config if
 // one exists, otherwise a synthetic baseline that reproduces their current live rights as
 // explicit "on" overrides. This is the lazy-migration view — it lets the editor show an
@@ -101,7 +74,9 @@ func (m *Materializer) BaselineConfig(name string) UserConfig {
 	u := m.live.Resolve(name)
 	cfg := UserConfig{Groups: []string{}, Overrides: map[string]string{}}
 	if !u.IsAdmin {
-		for _, key := range m.heldRights(u) {
+		// Reproduce the user's current live rights as explicit "on" overrides. The catalog owns
+		// this derivation so the baseline matches the API's per-user view exactly.
+		for _, key := range m.cat.HeldRights(u.Groups, m.live.ShellEnabled(u.Username)) {
 			cfg.Overrides[key] = "on"
 		}
 	}

@@ -146,6 +146,50 @@ func (c *Catalog) Rights() []RightRef {
 	return out
 }
 
+// RightKeySet returns the set of every declared right key — backing-group keys and shell
+// keys alike — i.e. every key that can currently be materialized. It is the single access
+// point for "which right keys exist"; the API validates configs and group definitions and
+// builds its grants view against it instead of re-deriving the set from Rights().
+func (c *Catalog) RightKeySet() map[string]bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]bool, len(c.groupService)+len(c.shellService))
+	for k := range c.groupService {
+		out[k] = true
+	}
+	for k := range c.shellService {
+		out[k] = true
+	}
+	return out
+}
+
+// HeldRights returns the declared rights a user currently holds, given their live Linux
+// groups and whether their login shell is enabled: every declared backing group they belong
+// to, plus every shell right when the shell is on (shell rights have no backing group — the
+// login shell itself is the source of truth). The result is sorted and always non-nil.
+//
+// This is the single source of truth for "which declared rights does this live state hold",
+// shared by the API's per-user rights view and the materializer's lazy-migration baseline.
+// Those two MUST agree exactly (the baseline is what an un-migrated user's first edit diffs
+// against), so the derivation lives here once rather than in two hand-synced copies.
+func (c *Catalog) HeldRights(userGroups []string, shellEnabled bool) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := []string{}
+	for _, g := range userGroups {
+		if _, ok := c.groupService[g]; ok {
+			out = append(out, g)
+		}
+	}
+	if shellEnabled {
+		for k := range c.shellService {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // KeyService resolves a right key (backing group or "svc:cat:id" shell key) to its
 // declaring service and kind ("group"|"shell"). It unifies ServiceOf and ShellServiceOf
 // so callers can authorize an arbitrary right key without first knowing its kind.
